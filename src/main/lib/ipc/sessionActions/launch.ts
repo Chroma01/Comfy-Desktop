@@ -54,7 +54,7 @@ import {
   flushBootPhasesOnFailure,
 } from '../../bootPhaseBuffer'
 import { appendLog } from '../../logsBroadcast'
-import { ensureManagerMirrorConfig } from '../../managerConfig'
+import { reconcileManagerConfigForLaunch } from '../../managerConfigLaunch'
 import { recoverInterruptedComfyOp } from '../../opMarker'
 import { migrateEnvLayout } from '../../../sources/standalone/install'
 import { writeComfyEnvironment } from '../../../sources/standalone/envPaths'
@@ -367,15 +367,16 @@ export async function handleLaunch({ event, installationId, inst: instArg, actio
     }
   }
 
-  if (!launchCmd.remote && settings.get('useChineseMirrors') === true) {
-    try {
-      await ensureManagerMirrorConfig(inst.installPath)
-    } catch (err) {
-      console.warn('Failed to seed ComfyUI-Manager mirror config:', err)
-      telemetry.capture('comfy.desktop.manager.mirror_seed_failed', {
-        ...buildErrorFields(err),
-      })
-    }
+  // Fail closed: launching after a failed config write would run Manager
+  // with stale security settings while the UI claims the chosen values.
+  const managerReconcile = await reconcileManagerConfigForLaunch({
+    remote: Boolean(launchCmd.remote),
+    installPath: inst.installPath,
+    securityLevel: inst.managerSecurityLevel,
+    networkMode: inst.managerNetworkMode,
+  })
+  if (!managerReconcile.ok) {
+    return { ok: false, message: i18n.t('errors.managerConfigWriteFailed') }
   }
 
   // Shared models and shared input/output are independent flags.

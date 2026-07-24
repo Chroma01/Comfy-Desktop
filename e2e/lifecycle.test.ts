@@ -31,6 +31,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { resolve } from 'node:path'
@@ -242,11 +243,72 @@ test.beforeAll(async () => {
   }
 })
 
+/** Install trees created by THIS run (fresh install + real-UI copies).
+ *  A green run removes all of them through the real UI (the copy-cleanup
+ *  and final Delete tests), so the afterAll sweep below is a no-op; it
+ *  exists so aborted/failed runs don't orphan multi-hundred-MB trees under
+ *  the installs root, which lives OUTSIDE the harness profile dir and is
+ *  therefore untouched by harness teardown. Hydrated (reused) installs are
+ *  never registered. */
+const _runCreatedInstallPaths = new Set<string>()
+
+/** The isolated profile's installations.json, or null on macOS where the
+ *  harness cannot isolate userData (Application Support ignores HOME) and
+ *  the store may list real installs that must never be swept. Mirrors
+ *  `dataDir()` in src/main/lib/paths.ts under the harness's env overrides
+ *  (APPDATA / XDG_DATA_HOME redirected into homeDir). */
+function isolatedInstallationsStorePath(homeDir: string): string | null {
+  if (process.platform === 'win32') {
+    return path.join(homeDir, 'AppData', 'Roaming', 'comfyui-desktop-2', 'installations.json')
+  }
+  if (process.platform === 'linux') {
+    return path.join(homeDir, '.local', 'share', 'comfyui-desktop-2', 'installations.json')
+  }
+  return null
+}
+
 test.afterAll(async () => {
   // ctx is unassigned when beforeAll throws before launching the app
   // (e.g. the nvidia-smi preflight) - don't bury that error under a
   // TypeError from teardown.
-  if (typeof ctx !== 'undefined') await ctx.cleanup()
+  if (typeof ctx === 'undefined') return
+
+  // Before teardown deletes the isolated profile, collect every local
+  // install it recorded: a fresh profile can only contain records this
+  // run created, so this also catches installs orphaned by an abort
+  // before any path-capturing test ran (e.g. mid-download).
+  if (!process.env['LIFECYCLE_REUSE_DIR']) {
+    const storePath = isolatedInstallationsStorePath(ctx.homeDir)
+    if (storePath) {
+      try {
+        const records = JSON.parse(readFileSync(storePath, 'utf-8')) as { installPath?: unknown }[]
+        for (const r of records) {
+          if (typeof r.installPath === 'string' && path.isAbsolute(r.installPath)) {
+            _runCreatedInstallPaths.add(r.installPath)
+          }
+        }
+      } catch { /* store never materialized - run aborted before any install */ }
+    }
+  }
+
+  await ctx.cleanup()
+
+  // Best-effort sweep, after the app is closed so nothing holds file
+  // locks. `force` tolerates trees the suite already deleted via the
+  // real UI. LIFECYCLE_REUSE_DIR preserves everything for greped
+  // re-runs, mirroring the harness's profile preservation.
+  if (!process.env['LIFECYCLE_REUSE_DIR']) {
+    if (_runCreatedInstallPaths.size > 0) {
+      console.log(`[lifecycle] afterAll sweep over ${_runCreatedInstallPaths.size} run-created install path(s): ${[..._runCreatedInstallPaths].join(', ')}`)
+    }
+    for (const p of _runCreatedInstallPaths) {
+      try {
+        rmSync(p, { recursive: true, force: true })
+      } catch (err) {
+        console.log(`[lifecycle] afterAll sweep failed to remove ${p}: ${(err as Error).message}`)
+      }
+    }
+  }
 })
 
 /** True iff a webContents with a localhost URL exists and is loaded. */
@@ -742,6 +804,7 @@ test('captures install metadata for the update tests @lifecycle', async () => {
   const inst = installs[0]!
   _updateInstallId = inst.id
   _updateInstallPath = inst.installPath
+  _runCreatedInstallPaths.add(_updateInstallPath)
   _comfyUIDir = path.join(_updateInstallPath, 'ComfyUI')
 
   // The install setup in test 2 pins the second-newest stable tag,
@@ -976,6 +1039,304 @@ test('captures a snapshot for the picker-driven restore test @lifecycle', async 
 })
 
 // ---------------------------------------------------------------------------
+// Manager security level + network mode: the per-install selections on the
+// picker's Startup Args tab must reach the config.ini ComfyUI-Manager
+// actually reads, via a real stop -> relaunch (handleLaunch's reconcile pass
+// runs before every local launch with the launched install's own record
+// values). Beyond the file check, the live server is probed through
+// Manager's real HTTP API to confirm the running Manager *enforces* the
+// security level, and the launched server's own startup log is checked to
+// confirm the running Manager *loaded* the network mode (its middle+
+// network-position gate only differs behind a non-loopback --listen, which
+// this loopback-bound suite cannot probe).
+// ---------------------------------------------------------------------------
+
+test('per-install Manager security level + network mode land in Manager config.ini and apply after relaunch @lifecycle', async () => {
+  test.setTimeout(600_000)
+  expect(_updateInstallPath, 'install path not captured').toBeTruthy()
+
+  // English labels for the four levels, keyed by stored value. A fresh
+  // record has no stored value and must render the pinned default
+  // (normal); a reused profile may carry a level from a prior run, so
+  // derive both the expected initial label and a distinct target from
+  // the persisted record instead of hardcoding them.
+  const LEVEL_LABELS: Record<string, string> = {
+    strong: 'Strict',
+    normal: 'Standard (recommended)',
+    'normal-': 'Relaxed',
+    weak: 'Permissive',
+  }
+  // English labels for the four Manager v4 network modes, keyed likewise.
+  const MODE_LABELS: Record<string, string> = {
+    public: 'Public (default)',
+    private: 'Private',
+    offline: 'Offline',
+    personal_cloud: 'Personal cloud',
+  }
+  // The file ComfyUI-Manager actually reads (modern system-user-api path).
+  const configPath = path.join(_updateInstallPath, 'ComfyUI', 'user', '__manager', 'config.ini')
+  /** A `[default]` option's value, or null when the file/key is absent. */
+  const readConfigOption = (key: string): string | null => {
+    if (!existsSync(configPath)) return null
+    const section = readFileSync(configPath, 'utf-8')
+      .split(/^\[/m).find((s) => s.startsWith('default]')) ?? ''
+    // Option keys are matched case-insensitively with flexible delimiters,
+    // mirroring Python configparser (section names stay case-sensitive:
+    // Manager only reads the exact `[default]`). Take the LAST match:
+    // Manager parses with strict=False, where later duplicates win, so a
+    // first-match read could hide a bad reconciliation.
+    const matches = [...section.matchAll(new RegExp(`^\\s*${key}\\s*[=:]\\s*(\\S+)\\s*$`, 'gim'))]
+    return matches.at(-1)?.[1] ?? null
+  }
+  const readConfigLevel = (): string | null => readConfigOption('security_level')
+  const readConfigMode = (): string | null => readConfigOption('network_mode')
+  /** An install-record field's persisted value, straight from the record. */
+  const readRecordField = (field: string): Promise<string | null> =>
+    ctx.panel.evaluate<string | null>(
+      `window.api.getInstallations().then((list) => {
+        const inst = list.find((i) => i.id === ${JSON.stringify(_updateInstallId)})
+        return (inst && inst[${JSON.stringify(field)}]) || null
+      })`,
+    )
+  const readRecordLevel = (): Promise<string | null> => readRecordField('managerSecurityLevel')
+  const readRecordMode = (): Promise<string | null> => readRecordField('managerNetworkMode')
+
+  /** Origin of the running ComfyUI server, from the loaded frontend webContents. */
+  const comfyOrigin = async (): Promise<string> => {
+    const origin = await ctx.app.evaluate(({ webContents }) => {
+      const wc = webContents
+        .getAllWebContents()
+        .find((w) => /^http:\/\/(127\.0\.0\.1|localhost):/.test(w.getURL()))
+      return wc ? new URL(wc.getURL()).origin : null
+    })
+    expect(origin, 'no running ComfyUI frontend to derive the server origin from').toBeTruthy()
+    return origin!
+  }
+  // Enforcement probe against the LIVE server: POST the packaged Manager's
+  // middle-risk /v2/snapshot/remove with a snapshot name that cannot exist.
+  // Manager checks is_allowed_security_level('middle') before touching
+  // anything and removing a nonexistent snapshot is a no-op, so the call
+  // observes enforcement without mutating the install: 403 iff the running
+  // Manager loaded `strong` (the security gate is this route's only 403 -
+  // its CSRF content-type rejection returns 400), 200 otherwise. A 404/405
+  // means Manager isn't serving its API at all and fails the probe loudly.
+  // The middle gate is the level's only clean observable here - git-url/pip
+  // installs are gated by dedicated config flags, and the high gate also
+  // depends on --listen exposure.
+  const probeTarget = `lifecycle-enforcement-probe-${randomUUID()}`
+  const managerBlocksMiddleRisk = async (): Promise<boolean> => {
+    // The allowed arm is only a guaranteed no-op while no snapshot by this
+    // name exists - assert that invariant instead of assuming it.
+    const probeSnapshotPath = path.join(
+      _updateInstallPath, 'ComfyUI', 'user', '__manager', 'snapshots', `${probeTarget}.json`,
+    )
+    expect(existsSync(probeSnapshotPath), `probe snapshot unexpectedly exists: ${probeSnapshotPath}`)
+      .toBe(false)
+    const res = await fetch(
+      `${await comfyOrigin()}/api/v2/snapshot/remove?target=${encodeURIComponent(probeTarget)}`,
+      { method: 'POST', signal: AbortSignal.timeout(15_000) },
+    )
+    if (res.status !== 403) {
+      expect(res.status, `unexpected snapshot/remove probe status ${res.status}`).toBe(200)
+      return false
+    }
+    return true
+  }
+  /** Whether Manager's middle-risk gate blocks at a given level. */
+  const middleBlockedAt = (level: string | null): boolean => level === 'strong'
+
+  // Production degrades an unrecognized record value to the default, so
+  // normalize the same way before deriving the expected trigger label.
+  const storedRaw = await readRecordLevel()
+  const storedBefore = storedRaw != null && Object.hasOwn(LEVEL_LABELS, storedRaw) ? storedRaw : null
+  const initialLabel = LEVEL_LABELS[storedBefore ?? 'normal']!
+  // The target must differ from BOTH the persisted record and whatever
+  // the on-disk config currently says - otherwise a broken/no-op launch
+  // reconciliation could pass vacuously against a config that already
+  // carried the target. Four levels guarantee a distinct pick exists.
+  // `strong` is preferred so the usual (fresh-profile) run lands on the
+  // level whose enforcement is observable through the middle-risk probe.
+  const configLevelBefore = readConfigLevel()
+  const targetValue = (['strong', 'weak', 'normal-'] as const).find(
+    (v) => v !== storedBefore && v !== configLevelBefore,
+  )!
+  const target = { value: targetValue, label: LEVEL_LABELS[targetValue]! }
+
+  // Same discipline for the network mode: normalize the persisted record
+  // the way production does, then pick a target differing from BOTH the
+  // record and the current config so the post-relaunch assertion observes
+  // a real disk transition. `personal_cloud` is preferred - it is the mode
+  // Desktop users actually need (installs under a non-loopback --listen)
+  // and, like every mode here, changes nothing else on a loopback bind.
+  // `offline` is never picked: it would disable Manager's registry fetch
+  // for later suite runs against a reused profile.
+  const storedModeRaw = await readRecordMode()
+  const storedModeBefore =
+    storedModeRaw != null && Object.hasOwn(MODE_LABELS, storedModeRaw) ? storedModeRaw : null
+  const initialModeLabel = MODE_LABELS[storedModeBefore ?? 'public']!
+  const configModeBefore = readConfigMode()
+  const targetModeValue = (['personal_cloud', 'private', 'public'] as const).find(
+    (v) => v !== storedModeBefore && v !== configModeBefore,
+  )!
+  const targetMode = { value: targetModeValue, label: MODE_LABELS[targetModeValue]! }
+
+  // Both settings are per-install; the picker edits must leave the global
+  // settings store untouched. Snapshot (rather than assert emptiness) so
+  // a reused profile carrying a stray settings.json key can't flake this.
+  const globalBefore = await ctx.panel.evaluate<string | null>(
+    `window.api.getSetting('managerSecurityLevel')`,
+  )
+  const globalModeBefore = await ctx.panel.evaluate<string | null>(
+    `window.api.getSetting('managerNetworkMode')`,
+  )
+
+  // Real entry: running host title pill -> picker Startup Args tab, the
+  // per-install surface this setting lives on.
+  const popup = await openPickerViaTitlePill(ctx.app, ctx.titleBar, 'config')
+
+  // The Startup Args tab hosts several BaseSelects (launch mode, browser
+  // partition, port conflict); the aria-label pins the manager one. Its
+  // trigger must show the level matching the persisted record - the
+  // pinned default on a fresh profile (guards against grabbing the wrong
+  // control as much as against a wrong default).
+  const trigger = 'button.ui-select-trigger[aria-label="Manager Security Level"]'
+  await popup.waitForVisible(trigger, { timeout: 15_000 })
+  expect(await popup.textOf(trigger)).toContain(initialLabel)
+
+  // Real DOM gesture: open the listbox, pick the target level.
+  expect(await popup.click(trigger)).toBe(true)
+  await popup.waitForVisible('.ui-select-listbox [role="option"]', { timeout: 10_000 })
+  expect(
+    await popup.clickByText('.ui-select-option', target.label),
+    `"${target.label}" option missing from the security-level listbox`,
+  ).toBe(true)
+  await expect
+    .poll(() => popup.textOf(trigger), { timeout: 10_000, intervals: [100, 250] })
+    .toContain(target.label)
+
+  // The picker field handler persists through the real installations
+  // store; wait for the write so the relaunch below cannot race it.
+  await expect
+    .poll(readRecordLevel, { timeout: 10_000, intervals: [100, 250] })
+    .toBe(target.value)
+
+  // Same real gesture on the paired Manager Network Mode select, which
+  // shares the security level's row in the Startup Args tab.
+  const modeTrigger = 'button.ui-select-trigger[aria-label="Manager Network Mode"]'
+  await popup.waitForVisible(modeTrigger, { timeout: 15_000 })
+  expect(await popup.textOf(modeTrigger)).toContain(initialModeLabel)
+  expect(await popup.click(modeTrigger)).toBe(true)
+  await popup.waitForVisible('.ui-select-listbox [role="option"]', { timeout: 10_000 })
+  expect(
+    await popup.clickByText('.ui-select-option', targetMode.label),
+    `"${targetMode.label}" option missing from the network-mode listbox`,
+  ).toBe(true)
+  await expect
+    .poll(() => popup.textOf(modeTrigger), { timeout: 10_000, intervals: [100, 250] })
+    .toContain(targetMode.label)
+  await expect
+    .poll(readRecordMode, { timeout: 10_000, intervals: [100, 250] })
+    .toBe(targetMode.value)
+
+  // Per-install means per-install: the global settings store must not
+  // change as a side effect of the picker edits.
+  expect(
+    await ctx.panel.evaluate<string | null>(`window.api.getSetting('managerSecurityLevel')`),
+    'managerSecurityLevel leaked into the global settings store',
+  ).toBe(globalBefore)
+  expect(
+    await ctx.panel.evaluate<string | null>(`window.api.getSetting('managerNetworkMode')`),
+    'managerNetworkMode leaked into the global settings store',
+  ).toBe(globalModeBefore)
+  await closeTitlePopupIfOpen(ctx.app)
+
+  // Changing the settings alone must NOT touch the config - only the
+  // launch-time reconcile pass may. This pins that the assertion after
+  // relaunch observes a real disk transition, not pre-existing content.
+  expect(
+    readConfigLevel(),
+    'Manager config changed before relaunch - reconcile must only run on launch',
+  ).toBe(configLevelBefore)
+  expect(
+    readConfigMode(),
+    'Manager network_mode changed before relaunch - reconcile must only run on launch',
+  ).toBe(configModeBefore)
+
+  // The still-running server must keep enforcing its LAUNCH-time level:
+  // Manager reads config.ini once at startup, so the picker edit alone
+  // must not change live behavior. Every launch in this suite reconciles
+  // the config first, so the running level equals the pre-edit file
+  // content; skip when that content is unrecognizable (hand-mutated
+  // reused profile), since production would have degraded it at launch.
+  if (configLevelBefore === null || Object.hasOwn(LEVEL_LABELS, configLevelBefore)) {
+    expect(
+      await managerBlocksMiddleRisk(),
+      'live Manager enforcement changed before relaunch - the level must only apply at startup',
+    ).toBe(middleBlockedAt(configLevelBefore))
+  }
+
+  // Full real stop -> relaunch so handleLaunch's reconcile pass runs
+  // against the on-disk install.
+  await stopAndReturnToDashboardViaUI()
+  await clickInstallTile(ctx.panel, 'ComfyUI')
+  await expect.poll(comfyFrontendIsLoaded, { timeout: 180_000, intervals: [1_000, 2_000] }).toBe(true)
+  // Same lazy panel remount dance as the snapshot test above - the
+  // chooser-pick attach destroyed the install-backed panel webContents.
+  expect(await ensureInstallPanelView(ctx.app, _updateInstallId)).toBe(true)
+  await waitForWebContents(ctx.app, 'panel.html')
+
+  // The chosen values must land in [default] of the file Manager actually
+  // reads - genuine disk transitions, since both targets were picked to
+  // differ from the pre-relaunch config content.
+  expect(existsSync(configPath), `Manager config not written at ${configPath}`).toBe(true)
+  expect(
+    readConfigLevel(),
+    `[default] security_level = ${target.value} missing from Manager config:\n`
+      + readFileSync(configPath, 'utf-8'),
+  ).toBe(target.value)
+  expect(
+    readConfigMode(),
+    `[default] network_mode = ${targetMode.value} missing from Manager config:\n`
+      + readFileSync(configPath, 'utf-8'),
+  ).toBe(targetMode.value)
+
+  // The file check alone would pass even if Manager ignored the config -
+  // probe the relaunched server's real API to confirm the running Manager
+  // enforces the selected level (403 on middle-risk actions at `strong`,
+  // allowed otherwise). With the strong-first target pick, the normal
+  // fresh-profile run exercises the blocked arm - a genuine behavioral
+  // flip from the pre-relaunch probe above.
+  expect(
+    await managerBlocksMiddleRisk(),
+    `running Manager does not enforce security level "${target.value}"`,
+  ).toBe(middleBlockedAt(target.value))
+
+  // Same idea for the network mode: prove the RUNNING Manager loaded it,
+  // not just that the file carries it. Manager v4 logs its loaded mode at
+  // import ("[ComfyUI-Manager] network_mode: <mode>", from config, not the
+  // file path Desktop wrote), and the launcher pipes the server's stdout to
+  // a per-launch logs/comfyui.log (flags 'w', so no stale line from an
+  // earlier launch can satisfy this). The mode's behavioral gate (middle+
+  // actions behind a non-loopback --listen) cannot flip on this suite's
+  // loopback bind, so the loaded-config log is the strongest live signal.
+  const serverLogPath = path.join(_updateInstallPath, 'logs', 'comfyui.log')
+  // Exact line match (not substring): a duplicate/malformed config could make
+  // Manager log a mode that merely starts with the expected value.
+  const expectedModeLine = `[ComfyUI-Manager] network_mode: ${targetMode.value}`
+  await expect
+    .poll(
+      () => existsSync(serverLogPath)
+        && readFileSync(serverLogPath, 'utf-8').split(/\r?\n/)
+          .some((l) => l.trim().endsWith(expectedModeLine)),
+      { timeout: 30_000, intervals: [500, 1_000] },
+    )
+    .toBe(true)
+
+  // The extra relaunch must not have disturbed the installed torch build.
+  expectTorchFamilyUnchanged('manager security-level relaunch changed the installed torch family')
+})
+
+// ---------------------------------------------------------------------------
 // Picker-driven update — driven through the picker's ChannelPicker.
 // Drafts a non-current channel ('latest') in the BaseSelect, clicks the
 // per-channel Update Now button, and waits for the IN_PLACE_RELAUNCH
@@ -1033,8 +1394,13 @@ test('picker-driven cross-channel update-comfyui (stable → latest) IN_PLACE_RE
   // Drafting a non-current channel mutates `state.draft` but does not
   // commit — the per-channel `selectedActions` switch to the drafted
   // channel's `{ update-comfyui, copy-update, switch-channel }` set.
-  await popup.waitForSelector('button[role="combobox"]', { timeout: 60_000 })
-  expect(await popup.click('button[role="combobox"]')).toBe(true)
+  // The aria-label scopes to the channel select: the popup remembers its
+  // last tab (e.g. Startup Args, which hosts several other comboboxes),
+  // so an unscoped combobox match can race the tab-content swap and grab
+  // a launch-settings select instead.
+  const channelSelect = 'button[role="combobox"][aria-label="Update Channel"]'
+  await popup.waitForSelector(channelSelect, { timeout: 60_000 })
+  expect(await popup.click(channelSelect)).toBe(true)
   await popup.waitForVisible('[role="listbox"] [role="option"]', { timeout: 10_000 })
   expect(
     await popup.clickByText('[role="listbox"] [role="option"]', 'Latest on GitHub'),
@@ -1387,6 +1753,7 @@ test('picker pin-bottom Copy creates a real ~500MB copy of the install @lifecycl
   const copyRecord = await waitForCopyRegistered(newName)
   _copyInstallId = copyRecord.id
   _copyInstallPath = copyRecord.installPath
+  _runCreatedInstallPaths.add(_copyInstallPath)
   await waitForOperationDrain(_updateInstallId)
 
   // Disk shape: copy is a full standalone tree (ComfyUI/.git +
@@ -1487,6 +1854,7 @@ test('dashboard kebab "Copy Installation" creates a real ~500MB copy @lifecycle'
   const copyRecord = await waitForCopyRegistered(newName)
   _kebabCopyInstallId = copyRecord.id
   _kebabCopyInstallPath = copyRecord.installPath
+  _runCreatedInstallPaths.add(_kebabCopyInstallPath)
   await waitForOperationDrain(_updateInstallId)
 
   // Disk shape: kebab copy materializes the same standalone tree the
