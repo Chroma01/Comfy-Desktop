@@ -33,6 +33,7 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
+import net from 'node:net'
 import path from 'node:path'
 import { resolve } from 'node:path'
 import { test, expect } from '@playwright/test'
@@ -45,10 +46,15 @@ import {
   openPickerViaTitlePill,
 } from './support/chooserHelpers'
 import {
+  armLaunchSpawnHold,
   ensureInstallPanelView,
   getIpcInvocations,
   getRunningSessionSnapshot,
+  hasActiveLaunch,
   hasActiveOperation,
+  isInstallLaunching,
+  isLaunchSpawnHeld,
+  releaseLaunchSpawnHold,
   resetIpcInvocations,
 } from './support/devHooks'
 import {
@@ -82,20 +88,41 @@ async function waitForConfigContinueEnabled(message: string): Promise<void> {
 
 /** True after `beforeAll` if an install record was hydrated from disk.
  *  Setup tests (consent / first-use / completes-install / post-install
- *  verification) skip themselves when this is set so the user can
- *  `--grep` a single later test against a reused profile.
+ *  verification) skip themselves when this is set so a subset of the
+ *  suite can run against a reused profile.
+ *
+ *  SECTIONS: every test carries a `@sec-<name>` tag grouping it with the
+ *  tests it shares state with. Each section is self-sufficient when run
+ *  as `@sec-setup|@sec-meta|@sec-<name>`: on a fresh profile the setup
+ *  spine builds the install first; on a hydrated profile the spine
+ *  self-skips and only the section runs. `@sec-meta` (captures install
+ *  id/path + the torch baseline) is cheap and must always be included.
+ *  The `test:e2e:lifecycle:<section>` npm scripts encode these patterns.
+ *
+ *    setup        first-use consent, install wizard, auto-launch checks
+ *    meta         install id/path + torch-family baseline capture
+ *    update       stop -> update-comfyui -> relaunch (needs update work
+ *                 to exist; may no-op on an already-updated profile)
+ *    crosschannel stable -> latest channel switch (one-shot per profile:
+ *                 requires updateChannel=stable and leaves it on latest)
+ *    snapshot     snapshot capture + picker-driven restore
+ *    manager      per-install Manager security level / network mode
+ *    picker       picker Restart / Stop / Relaunch CTAs
+ *    bootwindow   restart-during-boot regressions (run as a group: the
+ *                 fresh-chooser test consumes the siblings' --port edit)
+ *    copy         picker + kebab copies, untrack, and their cleanup
+ *    delete       stops comfy and DELETES the install (consumes a reused
+ *                 profile - reset the reuse dir before running setup again)
  *
  *  Usage:
- *    # First run: name a persistent dir so the profile survives cleanup.
+ *    # One section on a throwaway profile (builds the real install first):
+ *    pnpm run test:e2e:lifecycle:bootwindow
+ *
+ *    # Fast repeated section runs: persist the profile across runs.
  *    $env:LIFECYCLE_REUSE_DIR = "$env:TEMP\comfyui-lifecycle-reuse"
- *    pnpm exec playwright test e2e/lifecycle.test.ts --project=lifecycle \
- *      --reporter=list                                  # full suite, ~5-10 min
- *
- *    # Subsequent runs against the same dir: HYDRATED flips true,
- *    # setup tests skip, --grep picks what to re-run.
- *    pnpm exec playwright test e2e/lifecycle.test.ts --project=lifecycle \
- *      --grep "snapshot-restore" --reporter=list
- *
+ *    pnpm run test:e2e:lifecycle:install     # first run builds the install
+ *    pnpm run test:e2e:lifecycle:bootwindow  # setup skips, section only
+ *    pnpm run test:e2e:lifecycle:manager     # ditto
  *    Remove-Item Env:\LIFECYCLE_REUSE_DIR
  */
 let HYDRATED = false
@@ -324,7 +351,7 @@ async function comfyFrontendIsLoaded(): Promise<boolean> {
 // First-use takeover → New Install takeover
 // ---------------------------------------------------------------------------
 
-test('cold start lands on first-use start screen @lifecycle', async () => {
+test('cold start lands on first-use start screen @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: first-use already completed on the persisted profile')
   // The first-use takeover gates the chooser body until consent +
   // cloud/local pick + Continue are completed on the merged start
@@ -335,7 +362,7 @@ test('cold start lands on first-use start screen @lifecycle', async () => {
   await ctx.panel.waitForVisible('[data-testid="first-use-continue"]')
 })
 
-test('accept ToS + pick local (non-express) opens New Install takeover with form pre-filled @lifecycle', async () => {
+test('accept ToS + pick local (non-express) opens New Install takeover with form pre-filled @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: first-use already completed on the persisted profile')
 
   // Pick Local — reveals the Express-Install modifier. We want the
@@ -460,7 +487,7 @@ test('accept ToS + pick local (non-express) opens New Install takeover with form
   }
 })
 
-test('completes install (auto-launches via brand chrome) @lifecycle', async () => {
+test('completes install (auto-launches via brand chrome) @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: install already on disk on the persisted profile')
   // The CPU-variant pick at the end of the previous test re-fires the
   // variant option reload, which transiently disables Continue
@@ -479,7 +506,7 @@ test('completes install (auto-launches via brand chrome) @lifecycle', async () =
   await expect.poll(comfyFrontendIsLoaded, { timeout: 480_000, intervals: [1_000, 2_000] }).toBe(true)
 })
 
-test('first-use Local chain marks firstUseCompleted once and cycles firstUseMode @lifecycle', async () => {
+test('first-use Local chain marks firstUseCompleted once and cycles firstUseMode @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: first-use IPC log only exists on the boot that drove the chain')
   // Asserts the chain bookkeeping the auto-launch above relied on:
   //   - `markFirstUseCompleted` (set-setting firstUseCompleted=true)
@@ -503,7 +530,7 @@ test('first-use Local chain marks firstUseCompleted once and cycles firstUseMode
 // Launch & verify split-view + dark background
 // ---------------------------------------------------------------------------
 
-test('auto-launch landed on a single host window (in-place attach) @lifecycle', async () => {
+test('auto-launch landed on a single host window (in-place attach) @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: install was not auto-launched on this boot')
   // In-place attach guard: the redesigned install flow has
   // `autoLaunchOnFinish: true`, so the chooser host transforms into
@@ -532,7 +559,7 @@ test('auto-launch landed on a single host window (in-place attach) @lifecycle', 
  * BrowserWindow background is dark (#171717) so no white frame flashes
  * pre-load.
  */
-test('ComfyUI window has dark background and split-view architecture @lifecycle', async () => {
+test('ComfyUI window has dark background and split-view architecture @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: comfy is not auto-running on this boot')
   const arch = await evalWithRetry(() => ctx.app.evaluate(({ BrowserWindow, WebContentsView }) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -571,7 +598,39 @@ test('ComfyUI window has dark background and split-view architecture @lifecycle'
 // Dashboard navigation from a running install
 // ---------------------------------------------------------------------------
 
-test('picker Dashboard opens a chooser without stopping the running install @lifecycle', async () => {
+/** Close every window except the one hosting the live ComfyUI frontend,
+ *  then wait until it is the only window left. With more than one window
+ *  open, marker-based facades (panel/title-bar) can bind to the wrong
+ *  window's panel.html, so any test that opens an extra window must call
+ *  this before handing off. Keep whichever window owns the live comfy
+ *  frontend rather than trusting window ordering. The comfy frontend
+ *  lives in a child WebContentsView, so identify the host by inspecting
+ *  `contentView.children` (BrowserWindow.fromWebContents returns null
+ *  for child-view webContents). */
+async function closeExtraWindowsKeepComfyHost(): Promise<void> {
+  await evalWithRetry(() => ctx.app.evaluate(({ BrowserWindow, WebContentsView }) => {
+    const wins = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
+    const comfyHost = wins.find((w) =>
+      w.contentView.children.some((v) =>
+        v instanceof WebContentsView &&
+        /^http:\/\/(127\.0\.0\.1|localhost):/.test(v.webContents.getURL()),
+      ),
+    )
+    if (!comfyHost) throw new Error('running comfy host window not found')
+    for (const win of wins) {
+      if (win.id !== comfyHost.id) win.close()
+    }
+  }))
+  // Wait until only the comfy host remains so the marker-based
+  // panel/title-bar facades resolve unambiguously.
+  await expect
+    .poll(() => evalWithRetry(() => ctx.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed()).length,
+    )), { timeout: 15_000, intervals: [200, 500] })
+    .toBe(1)
+}
+
+test('picker Dashboard opens a chooser without stopping the running install @sec-setup @lifecycle', async () => {
   test.skip(HYDRATED, 'reuse mode: no running install-backed host exists')
   const before = await evalWithRetry(() => ctx.app.evaluate(({ BrowserWindow }) => {
     const wins = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
@@ -602,6 +661,20 @@ test('picker Dashboard opens a chooser without stopping the running install @lif
   expect(after.count).toBe(before.count + 1)
   expect(before.ids).toContain(after.comfyHostId)
 
+  // Close the extra chooser window before handing off: later tests (and
+  // section-subset runs that skip the update section entirely) must find
+  // exactly one window so panel/title-bar facades bind to the comfy host.
+  // Capture the install id THROUGH the extra chooser's panel first - the
+  // comfy host's own panel view was destroyed by the launch attach, so
+  // after the close no panel.html exists until it is remounted.
+  const installs = await ctx.panel.evaluate<Array<{ id: string }>>(`window.api.getInstallations()`)
+  expect(installs.length, 'no tracked installation to remount the panel for').toBeGreaterThan(0)
+  await closeExtraWindowsKeepComfyHost()
+  // Remount the install-backed panel (production mounts it lazily) so the
+  // following tests can keep reading state via `ctx.panel.evaluate`. Same
+  // dance the snapshot-capture and relaunch tests already do.
+  expect(await ensureInstallPanelView(ctx.app, installs[0]!.id)).toBe(true)
+  await waitForWebContents(ctx.app, 'panel.html')
 })
 
 // ---------------------------------------------------------------------------
@@ -759,44 +832,17 @@ async function stopAndReturnToDashboardViaUI(): Promise<void> {
     .toBe(true)
 }
 
-test('stop ComfyUI again so update-comfyui (requires stopped) can run @lifecycle', async () => {
+test('stop ComfyUI again so update-comfyui (requires stopped) can run @sec-update @lifecycle', async () => {
   test.setTimeout(300_000)
 
-  // Close the extra dashboard window the multi-window test opened FIRST,
-  // so the single remaining window is the comfy host and every
-  // marker-based facade (panel/title-bar) resolves to it unambiguously.
-  // Keep whichever window owns the live comfy frontend rather than
-  // trusting window ordering. Test-stage teardown, not a flow under test.
-  // The comfy frontend lives in a child WebContentsView, so identify
-  // the host by inspecting `contentView.children` (BrowserWindow
-  // .fromWebContents returns null for child-view webContents).
-  await evalWithRetry(() => ctx.app.evaluate(({ BrowserWindow, WebContentsView }) => {
-    const wins = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
-    const comfyHost = wins.find((w) =>
-      w.contentView.children.some((v) =>
-        v instanceof WebContentsView &&
-        /^http:\/\/(127\.0\.0\.1|localhost):/.test(v.webContents.getURL()),
-      ),
-    )
-    if (!comfyHost) throw new Error('running comfy host window not found')
-    for (const win of wins) {
-      if (win.id !== comfyHost.id) win.close()
-    }
-  }))
-  // Wait until only the comfy host remains so the marker-based
-  // panel/title-bar facades resolve unambiguously.
-  await expect
-    .poll(() => evalWithRetry(() => ctx.app.evaluate(({ BrowserWindow }) =>
-      BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed()).length,
-    )), { timeout: 15_000, intervals: [200, 500] })
-    .toBe(1)
-
   // Full real-UI stop + return: pill -> picker Stop -> confirm ->
-  // stopped card -> Return to Dashboard.
+  // stopped card -> Return to Dashboard. The multi-window test closes
+  // its own extra window, so exactly one window (the comfy host) exists
+  // here and the panel/title-bar facades resolve to it.
   await stopAndReturnToDashboardViaUI()
 })
 
-test('captures install metadata for the update tests @lifecycle', async () => {
+test('captures install metadata for the update tests @sec-meta @lifecycle', async () => {
   const installs = await ctx.panel.evaluate<InstallationLite[]>(
     `window.api.getInstallations()`,
   )
@@ -846,7 +892,7 @@ test('captures install metadata for the update tests @lifecycle', async () => {
   }
 })
 
-test('update-comfyui drives the real updater and moves HEAD forward @lifecycle', async () => {
+test('update-comfyui drives the real updater and moves HEAD forward @sec-update @lifecycle', async () => {
   // Real update can run pip-install if requirements.txt changed
   // between the older stable tag we installed on and the
   // latest stable tag. Stretch the per-test timeout to cover that.
@@ -896,7 +942,7 @@ test('update-comfyui drives the real updater and moves HEAD forward @lifecycle',
   expectTorchFamilyUnchanged('update-comfyui changed the installed torch family')
 })
 
-test('re-launch ComfyUI after update validates the updated install runs @lifecycle', async () => {
+test('re-launch ComfyUI after update validates the updated install runs @sec-update @lifecycle', async () => {
   await clickInstallTile(ctx.panel, 'ComfyUI')
   await expect.poll(comfyFrontendIsLoaded, { timeout: 180_000, intervals: [1_000] }).toBe(true)
 })
@@ -981,7 +1027,7 @@ async function waitForOperationDrain(installationId: string, timeout = 300_000):
 let _restoreSnapshotFilename = ''
 let _snapshotHeadAtCapture = ''
 
-test('captures a snapshot for the picker-driven restore test @lifecycle', async () => {
+test('captures a snapshot for the picker-driven restore test @sec-snapshot @lifecycle', async () => {
   // ComfyUI is running from the prior re-launch test. Captured label
   // gives us a stable filename to grab in the restore test below.
   expect(_updateInstallId, 'update install id not captured').toBeTruthy()
@@ -1051,7 +1097,7 @@ test('captures a snapshot for the picker-driven restore test @lifecycle', async 
 // this loopback-bound suite cannot probe).
 // ---------------------------------------------------------------------------
 
-test('per-install Manager security level + network mode land in Manager config.ini and apply after relaunch @lifecycle', async () => {
+test('per-install Manager security level + network mode land in Manager config.ini and apply after relaunch @sec-manager @lifecycle', async () => {
   test.setTimeout(600_000)
   expect(_updateInstallPath, 'install path not captured').toBeTruthy()
 
@@ -1203,16 +1249,10 @@ test('per-install Manager security level + network mode land in Manager config.i
   await popup.waitForVisible(trigger, { timeout: 15_000 })
   expect(await popup.textOf(trigger)).toContain(initialLabel)
 
-  // Real DOM gesture: open the listbox, pick the target level.
-  expect(await popup.click(trigger)).toBe(true)
-  await popup.waitForVisible('.ui-select-listbox [role="option"]', { timeout: 10_000 })
-  expect(
-    await popup.clickByText('.ui-select-option', target.label),
-    `"${target.label}" option missing from the security-level listbox`,
-  ).toBe(true)
-  await expect
-    .poll(() => popup.textOf(trigger), { timeout: 10_000, intervals: [100, 250] })
-    .toContain(target.label)
+  // Real DOM gestures: open the listbox and pick the target level. Retried
+  // as a whole cycle - a store-driven re-render can swap the option node
+  // between query and click and silently swallow a single raw click.
+  await popup.selectOption(trigger, target.label)
 
   // The picker field handler persists through the real installations
   // store; wait for the write so the relaunch below cannot race it.
@@ -1225,15 +1265,7 @@ test('per-install Manager security level + network mode land in Manager config.i
   const modeTrigger = 'button.ui-select-trigger[aria-label="Manager Network Mode"]'
   await popup.waitForVisible(modeTrigger, { timeout: 15_000 })
   expect(await popup.textOf(modeTrigger)).toContain(initialModeLabel)
-  expect(await popup.click(modeTrigger)).toBe(true)
-  await popup.waitForVisible('.ui-select-listbox [role="option"]', { timeout: 10_000 })
-  expect(
-    await popup.clickByText('.ui-select-option', targetMode.label),
-    `"${targetMode.label}" option missing from the network-mode listbox`,
-  ).toBe(true)
-  await expect
-    .poll(() => popup.textOf(modeTrigger), { timeout: 10_000, intervals: [100, 250] })
-    .toContain(targetMode.label)
+  await popup.selectOption(modeTrigger, targetMode.label)
   await expect
     .poll(readRecordMode, { timeout: 10_000, intervals: [100, 250] })
     .toBe(targetMode.value)
@@ -1360,7 +1392,7 @@ test('per-install Manager security level + network mode land in Manager config.i
 // beyond what's asserted below.
 // ---------------------------------------------------------------------------
 
-test('picker-driven cross-channel update-comfyui (stable → latest) IN_PLACE_RELAUNCH while running @lifecycle', async () => {
+test('picker-driven cross-channel update-comfyui (stable → latest) IN_PLACE_RELAUNCH while running @sec-crosschannel @lifecycle', async () => {
   // Real cross-channel update: switches the install's `updateChannel`
   // from `stable` to `latest`, runs the master-branch update, then
   // relaunches in place. Stretch the timeout to cover a possible
@@ -1457,7 +1489,7 @@ test('picker-driven cross-channel update-comfyui (stable → latest) IN_PLACE_RE
   await closeTitlePopupIfOpen(ctx.app)
 })
 
-test('picker-driven snapshot-restore IN_PLACE_RELAUNCH while running @lifecycle', async () => {
+test('picker-driven snapshot-restore IN_PLACE_RELAUNCH while running @sec-snapshot @lifecycle', async () => {
   test.setTimeout(600_000)
   expect(_restoreSnapshotFilename, 'restore-target snapshot not captured').toBeTruthy()
 
@@ -1544,7 +1576,7 @@ test('picker-driven snapshot-restore IN_PLACE_RELAUNCH while running @lifecycle'
 // invocation count for `stop-comfyui` stays at zero.
 // ---------------------------------------------------------------------------
 
-test('picker primary CTA Restart drives in-drawer confirm + re-launch @lifecycle', async () => {
+test('picker primary CTA Restart drives in-drawer confirm + re-launch @sec-picker @lifecycle', async () => {
   test.setTimeout(300_000)
 
   // The restore op ahead of us keeps its slot past the frontend-load
@@ -1631,7 +1663,7 @@ test('picker primary CTA Restart drives in-drawer confirm + re-launch @lifecycle
 // running install to the tests downstream.
 // ---------------------------------------------------------------------------
 
-test('picker More-menu Stop fires stop-comfyui; stopped-card Relaunch restores it @lifecycle', async () => {
+test('picker More-menu Stop fires stop-comfyui; stopped-card Relaunch restores it @sec-picker @lifecycle', async () => {
   test.setTimeout(300_000)
 
   // Sanity: the prior Restart test left ComfyUI running.
@@ -1709,6 +1741,369 @@ test('picker More-menu Stop fires stop-comfyui; stopped-card Relaunch restores i
 })
 
 // ---------------------------------------------------------------------------
+// Boot-window settings edits (issue #1300) + restart-during-boot.
+//
+// The spawned ComfyUI process consumes its launch configuration at spawn,
+// so an edit made while it boots (spawn -> port-ready) is not reflected in
+// that process. Two real-process regressions, using --port as the queryable
+// startup argument (the relaunched server must answer on the edited port):
+//
+// 1. An edit during the boot window surfaces "Restart to apply changes"
+//    once the instance is running, and the CTA restart actually applies it.
+// 2. A restart clicked while STILL booting cancels the in-flight boot and
+//    relaunches on the edited config. This used to be a silent no-op:
+//    `stopRunning` had no registered session to stop and the relaunch was
+//    rejected by the in-flight-operation guard.
+// ---------------------------------------------------------------------------
+
+/** A currently-free loopback TCP port, probed from the test process. Both
+ *  probe ranges sit far above the launcher's 8188..+1000 conflict-retry
+ *  range, so a dynamically-picked port can never collide by chance. */
+async function findFreeLoopbackPort(start: number): Promise<number> {
+  for (let port = start; port < start + 200; port++) {
+    const free = await new Promise<boolean>((resolve) => {
+      const srv = net.createServer()
+      srv.once('error', () => resolve(false))
+      srv.listen(port, '127.0.0.1', () => srv.close(() => resolve(true)))
+    })
+    if (free) return port
+  }
+  throw new Error(`no free loopback port found in [${start}, ${start + 200})`)
+}
+
+/** The persisted launchArgs string for the suite's install, straight from
+ *  the installations record. */
+function readRecordLaunchArgs(): Promise<string> {
+  return ctx.panel.evaluate<string>(
+    `window.api.getInstallations().then((list) => {
+      const inst = list.find((i) => i.id === ${JSON.stringify(_updateInstallId)})
+      return (inst && inst.launchArgs) || ''
+    })`,
+  )
+}
+
+/** Set `--port <port>` in the Startup Args raw input of the OPEN picker
+ *  popup (config tab) through the real input pipeline, replacing any prior
+ *  --port. The raw input commits on the native change event, so the edit is
+ *  committed by blurring, then confirmed against the persisted record. */
+async function setPortArgViaPicker(popup: WebContentsPage, port: number): Promise<void> {
+  const rawSel = '.args-raw-input input'
+  await popup.waitForVisible(rawSel, { timeout: 15_000 })
+  const before = await popup.evaluate<string>(
+    `document.querySelector(${JSON.stringify(rawSel)}).value`,
+  )
+  const withoutPort = before.replace(/--port(?:[ =]\S+)?/g, ' ').replace(/\s+/g, ' ').trim()
+  await popup.fill(rawSel, `${withoutPort} --port ${port}`.trim())
+  await popup.evaluate<boolean>(
+    `(() => { document.querySelector(${JSON.stringify(rawSel)}).blur(); return true })()`,
+  )
+  await expect
+    .poll(readRecordLaunchArgs, { timeout: 10_000, intervals: [100, 250] })
+    .toContain(`--port ${port}`)
+}
+
+/** Drive the open picker's primary CTA through its in-drawer confirm and
+ *  wait for main to hide the popup (it does so before firing the restart). */
+async function confirmPickerRestart(popup: WebContentsPage): Promise<void> {
+  await popup.waitForVisible(byTestId(TID.pickerPrimaryCta), { timeout: 15_000 })
+  expect(await popup.click(byTestId(TID.pickerPrimaryCta))).toBe(true)
+  await popup.waitForVisible(byTestId(TID.baseAlertAction), { timeout: 10_000 })
+  expect(await popup.click(byTestId(TID.baseAlertAction))).toBe(true)
+  await expect
+    .poll(() => isPopupVisible(ctx.app, 'comfyTitlePopup.html'), {
+      timeout: 10_000, intervals: [100, 200],
+    })
+    .toBe(false)
+}
+
+/** Restart the running install via the picker CTA and wait for the boot
+ *  window to open: no registered session, launch operation armed. */
+async function openBootWindowViaPickerRestart(): Promise<void> {
+  const popup = await openPickerViaTitlePill(ctx.app, ctx.titleBar)
+  await confirmPickerRestart(popup)
+  // One combined predicate: the boot window is open when the old session is
+  // gone AND the relaunch operation is active. Two sequential polls would be
+  // order-dependent - a relaunch that registers before the second poll starts
+  // sampling could never be observed and would burn the full timeout.
+  await expect
+    .poll(async () => {
+      const [session, active] = await Promise.all([
+        getRunningSessionSnapshot(ctx.app, _updateInstallId),
+        hasActiveOperation(ctx.app, _updateInstallId),
+      ])
+      return session === null && active
+    }, { timeout: 60_000, intervals: [250, 500] })
+    .toBe(true)
+}
+
+test('boot-window --port edit surfaces Restart-to-apply and the restart applies it @sec-bootwindow @lifecycle', async () => {
+  test.setTimeout(600_000)
+  await waitForOperationDrain(_updateInstallId)
+
+  let before: Awaited<ReturnType<typeof getRunningSessionSnapshot>> = null
+  await expect
+    .poll(async () => {
+      before = await getRunningSessionSnapshot(ctx.app, _updateInstallId)
+      return before
+    }, { timeout: 120_000, intervals: [1_000, 2_000] })
+    .not.toBeNull()
+  const targetPort = await findFreeLoopbackPort(19100)
+  expect(targetPort, 'target port must differ from the current one').not.toBe(before!.port)
+
+  // Restart through the real picker CTA to open a boot window, then edit
+  // the args MID-BOOT through the picker's Startup Args raw input.
+  await openBootWindowViaPickerRestart()
+  const popup = await openPickerViaTitlePill(ctx.app, ctx.titleBar, 'config')
+  await setPortArgViaPicker(popup, targetPort)
+
+  // The edit only proves anything if it landed inside the boot window -
+  // boots take tens of seconds, the UI edit a couple. Fail loudly if not.
+  expect(
+    await getRunningSessionSnapshot(ctx.app, _updateInstallId),
+    'boot completed before the boot-window edit landed - cannot exercise issue #1300',
+  ).toBeNull()
+
+  // The in-flight boot consumed its pre-edit config: it must come up on a
+  // port that is NOT the just-persisted target...
+  let booted: Awaited<ReturnType<typeof getRunningSessionSnapshot>> = null
+  await expect
+    .poll(async () => {
+      booted = await getRunningSessionSnapshot(ctx.app, _updateInstallId)
+      return booted
+    }, { timeout: 300_000, intervals: [1_000, 2_000] })
+    .not.toBeNull()
+  expect(
+    booted!.port,
+    'the in-flight boot must come up on the pre-edit port, not pick up an edit made after it spawned',
+  ).toBe(before!.port)
+
+  // ...and the popup (kept open across the boot - pending-restart state is
+  // renderer-local) must flip its CTA to "Restart to apply changes".
+  await expect
+    .poll(() => popup.textOf(byTestId(TID.pickerPrimaryCta)), {
+      timeout: 30_000, intervals: [250, 500],
+    })
+    .toContain('Restart to apply')
+
+  // Restart through the CTA: the relaunch must ACTUALLY apply the edit.
+  await confirmPickerRestart(popup)
+  await expect
+    .poll(async () => {
+      const after = await getRunningSessionSnapshot(ctx.app, _updateInstallId)
+      if (!after || after.startedAt <= booted!.startedAt) return null
+      return after.port
+    }, { timeout: 300_000, intervals: [1_000, 2_000] })
+    .toBe(targetPort)
+
+  // The queryable proof against the live server, not just the session record.
+  await expect
+    .poll(async () => {
+      try {
+        const res = await fetch(`http://127.0.0.1:${targetPort}/system_stats`, {
+          signal: AbortSignal.timeout(5_000),
+        })
+        return res.status
+      } catch { return 0 }
+    }, { timeout: 60_000, intervals: [1_000] })
+    .toBe(200)
+  await expect.poll(comfyFrontendIsLoaded, { timeout: 180_000, intervals: [1_000] }).toBe(true)
+  await closeTitlePopupIfOpen(ctx.app)
+})
+
+test('restart clicked during boot cancels the in-flight boot and applies the edited --port @sec-bootwindow @lifecycle', async () => {
+  test.setTimeout(600_000)
+  await waitForOperationDrain(_updateInstallId)
+
+  await expect
+    .poll(async () => getRunningSessionSnapshot(ctx.app, _updateInstallId), {
+      timeout: 120_000, intervals: [1_000, 2_000],
+    })
+    .not.toBeNull()
+  // A different probe range than the sibling test above, so this target
+  // can never equal the port the install is currently running on.
+  const targetPort = await findFreeLoopbackPort(19400)
+
+  // Boot window + mid-boot edit, as above.
+  await openBootWindowViaPickerRestart()
+  const popup = await openPickerViaTitlePill(ctx.app, ctx.titleBar, 'config')
+  await setPortArgViaPicker(popup, targetPort)
+  expect(
+    await getRunningSessionSnapshot(ctx.app, _updateInstallId),
+    'boot completed before the boot-window edit landed - cannot exercise restart-during-boot',
+  ).toBeNull()
+
+  // THE regression: restart while STILL booting. Pre-fix this was a silent
+  // no-op (no session for stopRunning; relaunch rejected by the in-flight
+  // guard) and the instance came up on the stale pre-edit config. The CTA
+  // and in-drawer confirm are clicked inline (not via confirmPickerRestart)
+  // so the boot window can be proven open right before the confirm click -
+  // otherwise a fast boot would silently degrade this into an ordinary
+  // running restart that passes without exercising the cancellation path.
+  await popup.waitForVisible(byTestId(TID.pickerPrimaryCta), { timeout: 15_000 })
+  expect(await popup.click(byTestId(TID.pickerPrimaryCta))).toBe(true)
+  await popup.waitForVisible(byTestId(TID.baseAlertAction), { timeout: 10_000 })
+  expect(
+    await isInstallLaunching(ctx.app, _updateInstallId),
+    'boot finished before the restart click - this run did not exercise restart-during-boot',
+  ).toBe(true)
+  expect(await getRunningSessionSnapshot(ctx.app, _updateInstallId)).toBeNull()
+  await resetIpcInvocations(ctx.app, 'picker-restart:cancel-launching')
+  expect(await popup.click(byTestId(TID.baseAlertAction))).toBe(true)
+  await expect
+    .poll(() => isPopupVisible(ctx.app, 'comfyTitlePopup.html'), {
+      timeout: 10_000, intervals: [100, 200],
+    })
+    .toBe(false)
+
+  // Decisive proof the boot-window path ran: main's restart handler must
+  // report the in-flight launch was actually cancelled. `cancelled: false`
+  // means the boot finished before the click landed and this run silently
+  // exercised the ordinary running-restart path instead.
+  await expect
+    .poll(async () => {
+      const calls = (await getIpcInvocations(ctx.app, 'picker-restart:cancel-launching')) as
+        Array<{ installationId?: string; cancelled?: boolean }>
+      return calls.find((c) => c.installationId === _updateInstallId)?.cancelled ?? null
+      // Must exceed cancelLaunching's own 60s deadline: the invocation is
+      // only recorded once that call resolves, and a slow-but-successful
+      // Windows process-tree kill can use most of it.
+    }, { timeout: 90_000, intervals: [250, 500] })
+    .toBe(true)
+
+  // The cancelled boot never registers; the relaunch must come up on the
+  // edited port. If the cancel regressed into a no-op, the surviving boot
+  // registers on the pre-edit port and this poll times out on it.
+  await expect
+    .poll(async () => {
+      const after = await getRunningSessionSnapshot(ctx.app, _updateInstallId)
+      return after?.port ?? null
+    }, { timeout: 300_000, intervals: [1_000, 2_000] })
+    .toBe(targetPort)
+  await expect
+    .poll(async () => {
+      try {
+        const res = await fetch(`http://127.0.0.1:${targetPort}/system_stats`, {
+          signal: AbortSignal.timeout(5_000),
+        })
+        return res.status
+      } catch { return 0 }
+    }, { timeout: 60_000, intervals: [1_000] })
+    .toBe(200)
+  await expect.poll(comfyFrontendIsLoaded, { timeout: 180_000, intervals: [1_000] }).toBe(true)
+  await closeTitlePopupIfOpen(ctx.app)
+})
+
+test('restart clicked during a FRESH chooser boot (unattached window) cancels it and applies the edited --port @sec-bootwindow @lifecycle', async () => {
+  test.setTimeout(600_000)
+  await waitForOperationDrain(_updateInstallId)
+
+  // Fresh-boot precondition: stop and return to the chooser, so the next
+  // launch comes from an UNATTACHED chooser host. `attachInstall` only sets
+  // `entry.installationId` at port-ready, so for the whole boot the window
+  // carries nothing but the chooser's staked `previewInstallationId` - the
+  // exact state in which main's restart identity guard used to discard the
+  // IPC, making restart-during-first-boot a silent no-op. (The sibling tests
+  // above restart an already-ATTACHED window, so they can never catch this.)
+  await stopAndReturnToDashboardViaUI()
+
+  const targetPort = await findFreeLoopbackPort(19700)
+  // The port the in-flight boot would come up on (persisted by the sibling
+  // test's edit) - must differ from the target so "the relaunch applied the
+  // mid-boot edit" is distinguishable from "the old boot survived".
+  const staleArgs = await readRecordLaunchArgs()
+  const staleMatch = /--port[ =](\d+)/.exec(staleArgs)
+  expect(staleMatch, `expected a persisted --port in launchArgs (got "${staleArgs}")`).not.toBeNull()
+  const stalePort = Number(staleMatch![1])
+  expect(stalePort).not.toBe(targetPort)
+
+  try {
+    // Park the NEXT launch at the spawn hold (launching marker set, port
+    // reserved, no process yet), then launch through the real chooser tile.
+    // The hold makes the boot window deterministic - every step below lands
+    // inside it by construction instead of racing real boot speed.
+    await armLaunchSpawnHold(ctx.app)
+    await clickInstallTile(ctx.panel, 'ComfyUI')
+    await expect
+      .poll(() => isLaunchSpawnHeld(ctx.app), { timeout: 120_000, intervals: [250, 500] })
+      .toBe(true)
+    expect(await hasActiveLaunch(ctx.app, _updateInstallId)).toBe(true)
+    expect(await isInstallLaunching(ctx.app, _updateInstallId)).toBe(true)
+    expect(await getRunningSessionSnapshot(ctx.app, _updateInstallId)).toBeNull()
+
+    // Mid-boot --port edit through the real picker, opened from the pill of
+    // the booting, preview-attached window.
+    const popup = await openPickerViaTitlePill(ctx.app, ctx.titleBar, 'config')
+    await setPortArgViaPicker(popup, targetPort)
+
+    // The CTA must offer Restart even though the window is only preview-
+    // attached (`useInstallCta` folds the preview claim into the active id).
+    await expect
+      .poll(() => popup.textOf(byTestId(TID.pickerPrimaryCta)), {
+        timeout: 15_000, intervals: [250, 500],
+      })
+      .toContain('Restart')
+
+    await resetIpcInvocations(ctx.app, 'picker-restart:cancel-launching')
+    expect(await popup.click(byTestId(TID.pickerPrimaryCta))).toBe(true)
+    await popup.waitForVisible(byTestId(TID.baseAlertAction), { timeout: 10_000 })
+    // Still parked: the confirm below provably lands inside the boot window.
+    expect(await isLaunchSpawnHeld(ctx.app)).toBe(true)
+    expect(await popup.click(byTestId(TID.baseAlertAction))).toBe(true)
+    await expect
+      .poll(() => isPopupVisible(ctx.app, 'comfyTitlePopup.html'), {
+        timeout: 10_000, intervals: [100, 200],
+      })
+      .toBe(false)
+
+    // Decisive main-side proof: the restart handler accepted the preview-
+    // attached window AND cancelled the in-flight launch. Pre-fix, the
+    // identity guard returned before cancelLaunching, so this channel
+    // recorded no invocation at all and this poll times out.
+    await expect
+      .poll(async () => {
+        const calls = (await getIpcInvocations(ctx.app, 'picker-restart:cancel-launching')) as
+          Array<{ installationId?: string; cancelled?: boolean }>
+        return calls.find((c) => c.installationId === _updateInstallId)?.cancelled ?? null
+        // Headroom past cancelLaunching's own 60s deadline (see the
+        // attached-window variant above).
+      }, { timeout: 90_000, intervals: [250, 500] })
+      .toBe(true)
+    // The cancel must have released the hold through the launch's abort
+    // signal - the parked boot unwound instead of proceeding to spawn.
+    await expect
+      .poll(() => isLaunchSpawnHeld(ctx.app), { timeout: 10_000, intervals: [100, 250] })
+      .toBe(false)
+
+    // The relaunch is a REAL boot and must come up on the edited port.
+    await expect
+      .poll(async () => {
+        const after = await getRunningSessionSnapshot(ctx.app, _updateInstallId)
+        return after?.port ?? null
+      }, { timeout: 300_000, intervals: [1_000, 2_000] })
+      .toBe(targetPort)
+    await expect
+      .poll(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${targetPort}/system_stats`, {
+            signal: AbortSignal.timeout(5_000),
+          })
+          return res.status
+        } catch { return 0 }
+      }, { timeout: 60_000, intervals: [1_000] })
+      .toBe(200)
+    // The cancelled boot never spawned, so nothing may serve the stale port.
+    await expect(
+      fetch(`http://127.0.0.1:${stalePort}/system_stats`, { signal: AbortSignal.timeout(3_000) }),
+    ).rejects.toThrow()
+    await expect.poll(comfyFrontendIsLoaded, { timeout: 180_000, intervals: [1_000] }).toBe(true)
+    await closeTitlePopupIfOpen(ctx.app)
+  } finally {
+    // Idempotent; a failed assertion must not leave a launch parked forever.
+    await releaseLaunchSpawnHold(ctx.app)
+  }
+})
+
+// ---------------------------------------------------------------------------
 // FLOW 2 — real copy via the picker's pin-bottom MoreMenu.
 //
 // `copy` is REQUIRES_STOPPED + a runAction prompt chain. The picker's
@@ -1720,7 +2115,7 @@ test('picker More-menu Stop fires stop-comfyui; stopped-card Relaunch restores i
 let _copyInstallId = ''
 let _copyInstallPath = ''
 
-test('picker pin-bottom Copy creates a real ~500MB copy of the install @lifecycle', async () => {
+test('picker pin-bottom Copy creates a real ~500MB copy of the install @sec-copy @lifecycle', async () => {
   test.setTimeout(600_000)
 
   // Copy is REQUIRES_STOPPED — stop comfy through the real UI (pill ->
@@ -1741,7 +2136,9 @@ test('picker pin-bottom Copy creates a real ~500MB copy of the install @lifecycl
   // Prompt for the copy's new name. The picker drives dialogs through
   // `useDialogs` → DialogHost → BasePrompt, so the surface carries the
   // base-prompt test ids (not ModalDialog's modal-prompt ones).
-  const newName = 'ComfyUI Copy E2E'
+  // Random suffix so a reused profile carrying a same-named copy from an
+  // aborted prior run can't satisfy `waitForCopyRegistered` vacuously.
+  const newName = `ComfyUI Copy E2E ${randomUUID().slice(0, 8)}`
   await submitCopyNamePrompt(popup, newName)
 
   await waitForProgressTakeoverAfterPopupClose()
@@ -1769,7 +2166,7 @@ test('picker pin-bottom Copy creates a real ~500MB copy of the install @lifecycl
   await closeTitlePopupIfOpen(ctx.app)
 })
 
-test('cleans up the copy install before the original delete test runs @lifecycle', async () => {
+test('cleans up the copy install before the original delete test runs @sec-copy @lifecycle', async () => {
   test.setTimeout(300_000)
   expect(_copyInstallId, 'no copy install id captured to clean up').toBeTruthy()
 
@@ -1818,7 +2215,7 @@ test('cleans up the copy install before the original delete test runs @lifecycle
 let _kebabCopyInstallId = ''
 let _kebabCopyInstallPath = ''
 
-test('dashboard kebab "Copy Installation" creates a real ~500MB copy @lifecycle', async () => {
+test('dashboard kebab "Copy Installation" creates a real ~500MB copy @sec-copy @lifecycle', async () => {
   test.setTimeout(600_000)
 
   // The prior cleanup test ran direct `runAction('delete')` against
@@ -1844,7 +2241,8 @@ test('dashboard kebab "Copy Installation" creates a real ~500MB copy @lifecycle'
   // prompt for the new install name (BasePrompt via useDialogs).
   await waitForWebContents(ctx.app, 'comfyTitlePopup.html')
   const popup = titlePopupPage(ctx.app)
-  const newName = 'ComfyUI Kebab Copy E2E'
+  // Random suffix: see the picker-copy test above.
+  const newName = `ComfyUI Kebab Copy E2E ${randomUUID().slice(0, 8)}`
   await submitCopyNamePrompt(popup, newName)
 
   // Copy op renders inline in the picker's right pane (same
@@ -1879,7 +2277,7 @@ test('dashboard kebab "Copy Installation" creates a real ~500MB copy @lifecycle'
   await closeTitlePopupIfOpen(ctx.app)
 })
 
-test('dashboard kebab "Untrack" removes the install from the registry without touching disk @lifecycle', async () => {
+test('dashboard kebab "Untrack" removes the install from the registry without touching disk @sec-copy @lifecycle', async () => {
   test.setTimeout(60_000)
   expect(_kebabCopyInstallId, 'no kebab-copy install id to untrack').toBeTruthy()
   expect(_kebabCopyInstallPath, 'no kebab-copy install path captured').toBeTruthy()
@@ -1927,7 +2325,7 @@ test('dashboard kebab "Untrack" removes the install from the registry without to
   expect(remaining.find((i) => i.id === _updateInstallId), 'untrack must not affect the original install').toBeDefined()
 })
 
-test('cleans up the untracked kebab-copy on disk before the final Delete test runs @lifecycle', async () => {
+test('cleans up the untracked kebab-copy on disk before the final Delete test runs @sec-copy @lifecycle', async () => {
   test.setTimeout(120_000)
   expect(_kebabCopyInstallPath, 'no kebab-copy install path to clean up').toBeTruthy()
   expect(existsSync(_kebabCopyInstallPath), 'kebab-copy dir already gone — Untrack test invariant violated').toBe(true)
@@ -1964,7 +2362,7 @@ test('cleans up the untracked kebab-copy on disk before the final Delete test ru
 let _deleteInstallId = ''
 let _deleteInstallPath = ''
 
-test('stops comfy and captures the installed dir state before driving delete @lifecycle', async () => {
+test('stops comfy and captures the installed dir state before driving delete @sec-delete @lifecycle', async () => {
   // delete is in REQUIRES_STOPPED — stop comfy through the real UI
   // (pill -> picker Stop -> confirm -> stopped card -> Return to
   // Dashboard) so the IPC handler doesn't bail on us. The return
@@ -1987,7 +2385,7 @@ test('stops comfy and captures the installed dir state before driving delete @li
   expect(existsSync(path.join(_deleteInstallPath, '.comfyui-desktop-2')), 'installed dir missing .comfyui-desktop-2 marker').toBe(true)
 })
 
-test('real delete wipes the fully-installed ~500MB tree off disk @lifecycle', async () => {
+test('real delete wipes the fully-installed ~500MB tree off disk @sec-delete @lifecycle', async () => {
   // Recursive delete of a full standalone install can take a while on
   // Windows when files are large (the .venv ships thousands of small
   // files plus a few hundred-MB torch wheels). Stretch the timeout.
