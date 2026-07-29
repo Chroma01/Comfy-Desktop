@@ -54,12 +54,32 @@ function deviceIdPath(): string {
   return path.join(configDir(), 'device-id.txt')
 }
 
+export function hasPersistedDeviceId(): boolean {
+  try {
+    return fs.existsSync(deviceIdPath())
+  } catch {
+    return false
+  }
+}
+
 function migrationGuardPath(): string {
   return path.join(configDir(), 'identity-migration-completed')
 }
 
 function firstLaunchGuardPath(): string {
   return path.join(configDir(), 'first-launch-completed')
+}
+
+/**
+ * Non-consuming check of the first-launch marker. Fails closed: treating a
+ * fresh install as existing only loses website-ID attribution.
+ */
+export function hasCompletedFirstLaunch(): boolean {
+  try {
+    return fs.existsSync(firstLaunchGuardPath())
+  } catch {
+    return true
+  }
 }
 
 /**

@@ -184,8 +184,7 @@ export function registerTelemetryHandlers(): void {
     mainTelemetry.registerPersonProperties(props)
   })
 
-  // On login: alias the anonymous installation_id into the user_id. Renderer
-  // still owns datadogRum.setUser (Datadog is browser-only).
+  // Renderer still owns datadogRum.setUser (Datadog is browser-only).
   ipcMain.on('telemetry:bindUserId', (_event, payload: unknown) => {
     if (!payload || typeof payload !== 'object') return
     const userId = asString((payload as Record<string, unknown>).userId)
@@ -194,8 +193,6 @@ export function registerTelemetryHandlers(): void {
     mainTelemetry.bindUserId(userId, properties)
   })
 
-  // Logout: switch distinct_id back to the anonymous installation_id (NOT
-  // posthog.reset(), which would clobber installation_id + download_token).
   ipcMain.on('telemetry:unbindUserId', () => {
     mainTelemetry.unbindUserId()
   })
