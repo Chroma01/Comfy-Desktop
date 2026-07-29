@@ -734,9 +734,8 @@ async function runLaunch(
 
   // Remote connection
   if (launchCmd.remote) {
-    // Display the host only — the full `launchCmd.url` carries UTM + a long
-    // desktop_device_id (see `withCloudDistributionUtm`) that mustn't leak
-    // into the user-facing status. `waitForUrl` below still gets the real URL.
+    // Display the host only — the full `launchCmd.url` may carry UTM params
+    // that do not belong in user-facing status. `waitForUrl` gets the real URL.
     const displayUrl = displayLaunchUrl(launchCmd.url || '')
     sendProgress('launch', { percent: -1, status: i18n.t('launch.connecting', { url: displayUrl }) })
     try {
