@@ -253,4 +253,11 @@ Issues and pull requests are welcome. Before opening a PR, please run `pnpm run 
 
 ## License
 
-Released under the [MIT License](LICENSE). © Comfy Org.
+Comfy Desktop is dual-licensed:
+
+- **[GNU Affero General Public License v3.0 or later](LICENSE)** - free for use under the AGPL's terms (including the network-use source-disclosure obligation).
+- **Commercial license** - for use in proprietary products or hosted services without AGPL obligations. Contact **[licensing@comfy.org](mailto:licensing@comfy.org)**.
+
+Exception: the [`@comfyorg/comfyui-desktop-bridge-types`](packages/comfyui-desktop-bridge-types) package (the TypeScript interface for the hosted frontend bridge) remains licensed under the [MIT License](packages/comfyui-desktop-bridge-types/LICENSE). This exception applies only to that package and does not determine the licensing obligations of other repository components or combined distributions.
+
+© Comfy Org.
