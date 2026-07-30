@@ -9,6 +9,7 @@ import {
   recordExposure,
   type ExperimentExposureSource
 } from '../experiments'
+import { normalizeExceptionContext } from '../../../shared/piiScrub'
 import { reportFirebaseAuthState } from '../firebaseAuthIdentity'
 import type { ComfyDesktop2FirebaseAuthState } from '../../../types/comfyDesktopBridge'
 import { isIllegalPostHogDistinctId, normalizeOpaqueIdentifier } from '../opaqueIdentifier'
@@ -139,6 +140,13 @@ function asProps(value: unknown): mainTelemetry.TelemetryContext {
   return asTelemetryObject(value, true, true)
 }
 
+function asExceptionProps(value: unknown): mainTelemetry.TelemetryContext {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return normalizeExceptionContext(
+    value as Record<string, unknown>
+  ) as mainTelemetry.TelemetryContext
+}
+
 function asPersonProps(value: unknown): Record<string, mainTelemetry.TelemetryValue> {
   return asTelemetryObject(value, false, false)
 }
@@ -187,18 +195,17 @@ export function registerTelemetryHandlers(): void {
   ipcMain.on('telemetry:capture', (event, payload: CapturePayload) => {
     const eventName = asString(payload?.event)
     if (!eventName) return
-    mainTelemetry.capture(eventName, withPlatformAxes(asProps(payload.properties), event?.sender))
+    mainTelemetry.emit(eventName, withPlatformAxes(asProps(payload.properties), event?.sender))
   })
 
   ipcMain.on('telemetry:captureException', (event, payload: CaptureExceptionPayload) => {
     const message = asString(payload?.message) ?? 'Unknown renderer error'
-    const stackStr = asString(payload?.stack) ?? undefined
+    const stackStr = asString(payload?.stack)
     const err = new Error(message)
     if (stackStr) err.stack = stackStr
-    mainTelemetry.captureException(
-      err,
-      withPlatformAxes(asProps(payload?.properties), event?.sender)
-    )
+    const properties = withPlatformAxes(asExceptionProps(payload?.properties), event?.sender)
+    const accepted = mainTelemetry.captureException(err, properties)
+    if (accepted) mainTelemetry.forwardExceptionToRenderer(properties)
   })
 
   ipcMain.on('telemetry:registerProperties', (_event, properties: unknown) => {

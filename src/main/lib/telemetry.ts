@@ -1,5 +1,5 @@
 /**
- * Main-process telemetry — single capture point for the launcher.
+ * Main-process telemetry - single capture point for the launcher.
  *
  * =========================================================================
  * REFERENCE FOR ANYONE ADDING NEW TELEMETRY
@@ -16,7 +16,7 @@
  * Datadog RUM still runs in the renderer (browser-only) but is gated to a
  * small failure-event allow-list in `src/shared/datadogMirroredEvents.ts`.
  *
- * ## Adding a product event — checklist
+ * ## Adding a product event - checklist
  *
  *   1. Pick a name. Convention: `comfy.desktop.<area>.<verb>` snake_case
  *      (e.g. `comfy.desktop.instance.switched`). Add to whichever code path
@@ -29,12 +29,12 @@
  *      to send `directory_bucket: 'checkpoints'` not raw `directory: '/Users/x/foo'`.
  *      Use helpers in `src/renderer/src/lib/telemetry.ts` (`toSizeBucket`,
  *      `toCountBucket`, `toErrorBucket`, `toModelDirectoryBucket`) and
- *      `src/shared/gpuTier.ts` — extend them instead of inlining new bucketing.
+ *      `src/shared/gpuTier.ts` - extend them instead of inlining new bucketing.
  *   4. If the event is a *failure* (`*.error`, crash, install failure, etc.),
  *      add the event name to `DATADOG_MIRRORED_EVENT_NAMES` so it also
  *      reaches Datadog and a monitor can fire on it.
  *   5. Add an insight to the relevant PostHog dashboard. Don't ship events
- *      that don't end up on a dashboard or in a saved query — that's how
+ *      that don't end up on a dashboard or in a saved query - that's how
  *      telemetry rots into noise.
  *
  * ## Identity model
@@ -57,9 +57,9 @@
  *
  * ## Consent (three-state)
  *
- *   - `'granted'`   — collect everything.
- *   - `'denied'`    — collect nothing.
- *   - `'undecided'` — fresh install or Desktop-1 migrator; collect ONLY
+ *   - `'granted'`   - collect everything.
+ *   - `'denied'`    - collect nothing.
+ *   - `'undecided'` - fresh install or Desktop-1 migrator; collect ONLY
  *                     `comfy.desktop.first_use.consent_decision` until the
  *                     user makes a choice.
  *
@@ -70,7 +70,7 @@
  *
  *   PostHog gets everything. Datadog only mirrors the failure / reliability
  *   allow-list in `src/shared/datadogMirroredEvents.ts`. Datadog is for
- *   alerting, not analysis — adding a name to the allow-list is a
+ *   alerting, not analysis - adding a name to the allow-list is a
  *   deliberate ops decision ("I want a monitor on this"). PostHog
  *   dashboards + ad-hoc HogQL are the source of truth for everything else.
  *
@@ -80,7 +80,7 @@
  *   or `window.api.telemetryGetExperimentFlag(key)` from the renderer
  *   (cache-first; first-ever boot fails closed to control). Record
  *   exposure with `recordExposure(key, variant, source)` or its IPC
- *   equivalent — per-session dedup is enforced main-side. Outcome events
+ *   equivalent - per-session dedup is enforced main-side. Outcome events
  *   are normal product events; PostHog joins them to the exposure at query
  *   time via the standard experiment view.
  *
@@ -105,6 +105,7 @@
  */
 import { app } from 'electron'
 import { PostHog } from 'posthog-node'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 // PostHog's `FeatureFlagValue` lives in `@posthog/core` and is not
 // re-exported by `posthog-node`. Inlining the shape we actually use.
@@ -116,8 +117,8 @@ import {
 } from '../../shared/posthogConfig'
 import { isDatadogMirroredEvent } from '../../shared/datadogMirroredEvents'
 import { bucketError as sharedBucketError } from '../../shared/errorBucket'
-import { buildErrorFields } from '../../shared/errorEvent'
-import { scrubAll } from '../../shared/piiScrub'
+import { buildErrorFields, ERROR_MESSAGE_MAX, ERROR_STACK_MAX } from '../../shared/errorEvent'
+import { normalizeExceptionContext, scrubAll } from '../../shared/piiScrub'
 import {
   clearPersistedUnmergeableAnonymousEpoch,
   hasPersistedUnmergeableAnonymousEpoch,
@@ -138,7 +139,7 @@ export type TelemetryContext = Record<string, TelemetryValue | TelemetryValue[]>
 /**
  * Long-lived renderer WebContents that receive main-emitted telemetry events
  * for fan-out to renderer-side Datadog RUM. Registered exactly once per host
- * window — the title-bar WebContents, which is built unconditionally for
+ * window - the title-bar WebContents, which is built unconditionally for
  * every host window in `createHostWindow()` and survives mode flips, so
  * Datadog RUM gets a session per host window regardless of whether the
  * panelView is currently mounted.
@@ -164,15 +165,15 @@ export function unregisterTelemetryRelayTarget(wc: Electron.WebContents): void {
   _telemetryRelayTargets.delete(wc)
 }
 
-/** @internal — exposed for tests. */
+/** @internal - exposed for tests. */
 export function _resetTelemetryRelayTargets(): void {
   _telemetryRelayTargets.clear()
 }
 
 /**
- * @internal — exposed for tests. Resets module-level identity / consent /
+ * @internal - exposed for tests. Resets module-level identity / consent /
  * pending state so consecutive test suites don't share state. Does not
- * close an in-flight PostHog client — tests bring their own mocked one.
+ * close an in-flight PostHog client - tests bring their own mocked one.
  */
 export function _resetForTest(): void {
   client = null
@@ -194,7 +195,7 @@ export function _resetForTest(): void {
   queuedPendingIdentityMergeIds.clear()
 }
 
-/** @internal — exposed for tests. */
+/** @internal - exposed for tests. */
 export function _telemetryRelayTargetCount(): number {
   return _telemetryRelayTargets.size
 }
@@ -237,12 +238,12 @@ function canEmit(): boolean {
  * `client` so
  * per-event filters / breakdowns work without a join against the person
  * profile (PostHog person properties are joined at query time and are
- * point-in-time as of write — releasing a new app version while the user
+ * point-in-time as of write - releasing a new app version while the user
  * still has events from the old one would mis-attribute without this).
  * `installation_id` is added by `bindAnonymousId()` once installation metadata is known
  * at boot, so renderer events (routed in over IPC) and main events share the
  * machine hash as the default join key. Call sites that override it per-call
- * with a per-install record id still split that key — #1159 moves those
+ * with a per-install record id still split that key - #1159 moves those
  * overrides to `install_id`.
  *
  * Per-call properties take precedence on key collision.
@@ -258,7 +259,7 @@ let defaultEventProperties: Record<string, TelemetryValue> = {}
 export type Deployment = 'local' | 'cloud' | 'remote'
 
 /** Narrow an untrusted value (payload property, source-plugin category) to a
- *  valid `Deployment`, or `null` — never let junk reach the shared axis. */
+ *  valid `Deployment`, or `null` - never let junk reach the shared axis. */
 export function asDeployment(value: unknown): Deployment | null {
   return value === 'local' || value === 'cloud' || value === 'remote' ? value : null
 }
@@ -284,10 +285,10 @@ function deriveAppChannel(appVersion: string): string {
 /**
  * Three-state consent.
  *
- * - `'granted'` — user opted in. Everything ships.
- * - `'denied'` — user opted out. Nothing ships, EXCEPT the
- *   `PRE_CONSENT_ALLOWED_EVENTS` set — see the next paragraph for why.
- * - `'undecided'` — user has not chosen yet (fresh install OR a Desktop-1
+ * - `'granted'` - user opted in. Everything ships.
+ * - `'denied'` - user opted out. Nothing ships, EXCEPT the
+ *   `PRE_CONSENT_ALLOWED_EVENTS` set - see the next paragraph for why.
+ * - `'undecided'` - user has not chosen yet (fresh install OR a Desktop-1
  *   migrator whose `telemetryEnabled` setting was never set).
  *   Only events in `PRE_CONSENT_ALLOWED_EVENTS` ship; everything
  *   else is suppressed until the user makes a choice. Mirrors
@@ -299,7 +300,7 @@ function deriveAppChannel(appVersion: string): string {
  * write (which propagates to `setConsentState('denied')` here) and only
  * then calls `emitTelemetryAction('first_use.consent_decision', { decision: 'decline' })`.
  * If `isAllowedToFire` short-circuited on `'denied'` without consulting the
- * allow-list, every decline would be dropped — meaning we'd have 100%
+ * allow-list, every decline would be dropped - meaning we'd have 100%
  * accept-rate signal and zero ability to measure decline. The allow-list
  * is intentionally the FIRST check so the decision event survives the
  * exact state it triggers.
@@ -318,7 +319,7 @@ const PRE_CONSENT_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
 
 function isAllowedToFire(event: string): boolean {
   // Allow-list takes precedence over every state, including 'denied'.
-  // See the ConsentState docstring above for the full reasoning — short
+  // See the ConsentState docstring above for the full reasoning - short
   // version: the consent decision event races the 'denied' state flip
   // and would otherwise be dropped by its own decision.
   if (PRE_CONSENT_ALLOWED_EVENTS.has(event)) return true
@@ -327,7 +328,7 @@ function isAllowedToFire(event: string): boolean {
 }
 
 /**
- * SDK-level volume safety net — two layers, both belt-and-braces around
+ * SDK-level volume safety net - two layers, both belt-and-braces around
  * the per-call-site dedup guards that individual emit paths add.
  *
  * Motivation: the 2026-06-02 volume incident shipped 3M+ events of the
@@ -349,13 +350,13 @@ function isAllowedToFire(event: string): boolean {
  *
  * Layer 2: per-process total cap.
  *   After 5000 events captured this process, every further capture
- *   no-ops. 5000 covers a heavy multi-hour workflow user (~500–1000
- *   events) with 5–10x headroom, and turns "millions of events" into
+ *   no-ops. 5000 covers a heavy multi-hour workflow user (~500-1000
+ *   events) with 5-10x headroom, and turns "millions of events" into
  *   "at most 5000" for any single runaway install. One
  *   `comfy.desktop.telemetry.session_cap_hit` warning fires once when the
  *   cap is crossed.
  *
- * `*.error` events bypass Layer 1 — error volume is exactly the signal
+ * `*.error` events bypass Layer 1 - error volume is exactly the signal
  * we need most during incidents, and `*.error` events are not the
  * shape of any loop we've seen. Layer 2 still applies (a runaway
  * error loop would still hit the cap).
@@ -390,8 +391,9 @@ function _emitWarning(event: string, properties: TelemetryContext): void {
       event,
       properties: enforcePersonProcessingPolicy({ ...defaultEventProperties, ...properties })
     })
+    forwardToRenderer(event, properties)
   } catch {
-    // ignore – the warning is best-effort
+    // ignore - the warning is best-effort
   }
 }
 
@@ -489,10 +491,10 @@ export interface InitOptions {
 }
 
 /**
- * Initialize PostHog Node. Safe to call before consent decision is known —
+ * Initialize PostHog Node. Safe to call before consent decision is known -
  * events are queued by setConsent(false) and dropped at capture time.
  *
- * Note: the session-start event is intentionally NOT emitted here — D is
+ * Note: the session-start event is intentionally NOT emitted here - D is
  * unknown until `bindAnonymousId()` runs, which flushes it under that D.
  */
 export function initTelemetry(opts: InitOptions): void {
@@ -521,7 +523,7 @@ export function initTelemetry(opts: InitOptions): void {
   // analytics, (b) dev-mode app-update behavior tends to produce
   // pathological event shapes (e.g. the updater repeatedly
   // "discovering" the staged build). Beta / canary / stable channels
-  // still emit normally — only the unpackaged local-source case is
+  // still emit normally - only the unpackaged local-source case is
   // gated.
   //
   // FLAG READS are NOT suppressed: a dev working on a feature gated by
@@ -579,7 +581,7 @@ let pendingSessionStart: Record<string, TelemetryValue> | null = null
  * Deferred once-ever first-launch event payload. The guard file in
  * `deviceId.ts` is consumed at boot (so it can never re-fire on a later
  * launch), but on a fresh install consent is still `'undecided'` at that
- * moment — the event would be dropped by `isAllowedToFire` and the guard
+ * moment - the event would be dropped by `isAllowedToFire` and the guard
  * would be burned for nothing. Holding the payload here lets it ship on the
  * `undecided → granted` transition via `tryFlushDeferred()`, exactly like
  * `pendingSessionStart`. A `'denied'` choice never flushes it, which is the
@@ -686,7 +688,7 @@ function flushPendingIdentityMerges(): Promise<void> {
 
 /**
  * Ship deferred one-shot state. Each buffer is cleared only when its capture
- * was actually admitted — a silent drop (SDK throw, volume guard) keeps the
+ * was actually admitted - a silent drop (SDK throw, volume guard) keeps the
  * payload queued for the next flush trigger instead of losing it forever.
  */
 function tryFlushDeferred(): void {
@@ -927,7 +929,7 @@ export function markAnonymousEpochUnmergeable(): boolean {
  * Defense-in-depth: run every string-valued property through `scrubAll`
  * before it leaves the process. Callers should still scrub at the emit
  * site (so the field shape is intentional and the scrub is visible in
- * code review) — this is the last-resort safety net that catches future
+ * code review) - this is the last-resort safety net that catches future
  * emit sites that forget. Mirrors the renderer's `scrubTelemetryContext`
  * pass; without it, any new main-process call site that ships raw
  * strings (`error_message`, `last_stderr`, free-text from external libs)
@@ -988,7 +990,7 @@ export function capture(event: string, properties: TelemetryContext = {}): boole
   if (!isAllowedToFire(event)) return false
   if (!_checkRateLimit(event)) return false
   try {
-    // Per-call properties override defaults on key collision — callers
+    // Per-call properties override defaults on key collision - callers
     // that explicitly pass `app_version` (e.g. session-start payload,
     // legacy event re-emitters) win.
     // `$ip` is intentionally NOT stripped here: PostHog needs the request IP
@@ -1004,7 +1006,7 @@ export function capture(event: string, properties: TelemetryContext = {}): boole
     _recordCapturedEvent(event)
     return true
   } catch {
-    // swallow – telemetry must never break the app
+    // swallow - telemetry must never break the app
     return false
   }
 }
@@ -1015,7 +1017,7 @@ export function capture(event: string, properties: TelemetryContext = {}): boole
  *
  * The caller's on-disk guard (in `deviceId.ts`) is consumed at boot, so this
  * fires for at most one launch in the installation's lifetime. But that launch
- * is, by definition, a fresh install whose consent is still `'undecided'` —
+ * is, by definition, a fresh install whose consent is still `'undecided'` -
  * routing it through plain `capture()` would drop it on the consent gate while
  * the guard stays burned, so the event would never reach PostHog. Instead we
  * queue the payload and let `tryFlushDeferred()` ship it on the
@@ -1107,26 +1109,42 @@ export function captureInstallCompleted(opts: {
   })
   // Durable per-person activation milestone (#1224). All four methods
   // (express/manual/adopt/migrate) are local installs, so this stamps the
-  // person the first time they EVER complete a local install — even across
+  // person the first time they EVER complete a local install - even across
   // quits, reinstalls, or a second machine. Lets the funnel distinguish
   // "onboarded but never installed" from "abandoned then recovered later".
   registerPersonPropertiesOnce({ first_local_install_completed_at: new Date().toISOString() })
 }
 
-export function captureException(error: unknown, properties: TelemetryContext = {}): void {
-  if (!canEmit() || !distinctId) return
+export function captureException(error: unknown, properties: TelemetryContext = {}): boolean {
+  if (!canEmit() || !distinctId) return false
   // Exceptions are reliability data; suppress them outside `'granted'`.
-  if (consentState !== 'granted') return
+  if (consentState !== 'granted') return false
+  if (!_checkRateLimit('comfy.desktop.exception.error')) return false
   try {
     // Same default merge as capture() so exception events stay filterable by
     // the shared axes (app_version, client, ...) instead of arriving bare.
+    const source = error instanceof Error ? error : new Error(String(error))
+    const safeError = new Error(scrubAll(source.message || source.name).slice(0, ERROR_MESSAGE_MAX))
+    safeError.name = scrubAll(source.name || 'Error').slice(0, 128)
+    if (source.stack) safeError.stack = scrubAll(source.stack).slice(0, ERROR_STACK_MAX)
+    const safeErrorRecord = safeError as Error & Record<string, unknown>
+    for (const [key, value] of Object.entries(source).slice(0, 32)) {
+      if (typeof value === 'string' && !['message', 'name', 'stack'].includes(key)) {
+        safeErrorRecord[scrubAll(key).slice(0, 128)] = scrubAll(value).slice(0, ERROR_MESSAGE_MAX)
+      }
+    }
     client!.captureException(
-      error,
+      safeError,
       distinctId,
-      enforcePersonProcessingPolicy({ ...defaultEventProperties, ...properties })
+      normalizeExceptionContext(
+        enforcePersonProcessingPolicy({ ...defaultEventProperties, ...properties })
+      ) as TelemetryContext
     )
+    _recordCapturedEvent('comfy.desktop.exception.error')
+    return true
   } catch {
     // ignore
+    return false
   }
 }
 
@@ -1136,7 +1154,7 @@ export function captureException(error: unknown, properties: TelemetryContext = 
  * Used by the experiments module's boot-time refresh. Returns `{}` on
  * timeout / failure so the caller can fall back to its cached values
  * without distinguishing failure modes. Suppressed unless consent is
- * `'granted'` — flag evaluation requests carry the distinct id and
+ * `'granted'` - flag evaluation requests carry the distinct id and
  * person properties to PostHog, so they must not ship pre-consent.
  *
  * The returned record's keys are PostHog flag/experiment names; values
@@ -1173,7 +1191,7 @@ export async function loadFeatureFlagsImmediate(
  * reserved for kill-switches and capacity-protection flags (e.g.
  * `desktop-cloud-capacity`), not A/B experiments or analytics. Those
  * are server-config pushed *to* the client to protect service
- * availability for everyone — distinct from analytics data collected
+ * availability for everyone - distinct from analytics data collected
  * *from* the user, which `loadFeatureFlagsImmediate` correctly gates on
  * consent. The evaluation call supplies only the installation-stable
  * evaluation key and flag key; no person properties are sent.
@@ -1193,7 +1211,7 @@ export async function getOpsFlag(
   if (!client) return undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    // No `personProperties` — ops flags are global, not user-keyed.
+    // No `personProperties` - ops flags are global, not user-keyed.
     // We record explicit experiment exposures elsewhere. Disabling the SDK's
     // implicit `$feature_flag_called` write also prevents this evaluation-only
     // key from creating a PostHog person behind the capture policy.
@@ -1218,28 +1236,51 @@ export async function getOpsFlag(
  * desktop's `@trackEvent` decorator. Errors are re-thrown so callers can
  * continue normal control flow.
  */
+interface TrackedStepScope {
+  failedStage?: string
+  failureContext?: TelemetryContext
+}
+
+const trackedStepScope = new AsyncLocalStorage<TrackedStepScope>()
+
 export async function trackedStep<T>(
   step: string,
   context: TelemetryContext,
-  fn: () => Promise<T>
+  fn: () => Promise<T>,
+  options: { emitError?: boolean; canonicalError?: boolean } = {}
 ): Promise<T> {
   capture(`${step}.start`, context)
   const t0 = Date.now()
+  const canonicalScope: TrackedStepScope | undefined = options.canonicalError ? {} : undefined
   try {
-    const result = await fn()
+    const result = options.canonicalError
+      ? await trackedStepScope.run(canonicalScope!, fn)
+      : await fn()
     capture(`${step}.end`, { ...context, duration_ms: Date.now() - t0 })
     return result
   } catch (err) {
+    const scope = canonicalScope ?? trackedStepScope.getStore()
+    if (scope && !options.canonicalError && !scope.failedStage) {
+      scope.failedStage = step
+      scope.failureContext = context
+    }
     // Standard error schema (class / message / bucket / signature) so every
     // `${step}.error` (adopt.register, migrate.*, snapshot.restore_*) is
     // diagnosable and groups by class regardless of locale or user paths.
     // `emit` (not `capture`) so allow-listed step errors also mirror to Datadog
     // for alerting; the `.start` / `.end` funnel events stay PostHog-only.
-    emit(`${step}.error`, {
-      ...context,
-      duration_ms: Date.now() - t0,
-      ...buildErrorFields(err)
-    })
+    const shouldEmitError =
+      options.emitError === true ||
+      (options.emitError !== false && (!scope || options.canonicalError))
+    if (shouldEmitError) {
+      emit(`${step}.error`, {
+        ...context,
+        ...(scope?.failureContext || {}),
+        ...(scope?.failedStage ? { failed_stage: scope.failedStage } : {}),
+        duration_ms: Date.now() - t0,
+        ...buildErrorFields(err)
+      })
+    }
     throw err
   }
 }
@@ -1253,13 +1294,13 @@ export const bucketError = sharedBucketError
 /**
  * Forward an event to renderer-side Datadog RUM via the registered
  * telemetry relay targets (title bars). PostHog is intentionally NOT
- * fanned out here — `capture()` already sent the event from PostHog Node,
+ * fanned out here - `capture()` already sent the event from PostHog Node,
  * and the `mainAlreadyCaptured: true` flag in the payload tells the
  * renderer-side bootstrap to skip its PostHog Browser mirror so events
  * aren't double-counted.
  *
  * If no relay target is currently registered (no host window open yet),
- * the broadcast is a silent no-op — PostHog Node still captures the event
+ * the broadcast is a silent no-op - PostHog Node still captures the event
  * via `capture()`, so the event isn't lost; only its Datadog RUM mirror
  * is dropped, which is acceptable for the brief window before the first
  * host window opens.
@@ -1277,7 +1318,43 @@ export function forwardToRenderer(event: string, context: TelemetryContext = {})
       try {
         wc.send('telemetry-action-from-main', payload)
       } catch {
-        // ignore – telemetry must never break the app
+        // ignore - telemetry must never break the app
+      }
+    }
+  }
+}
+
+/** Forward an accepted exception to the renderer-only Datadog SDK without diagnostics. */
+export function forwardExceptionToRenderer(context: TelemetryContext = {}): void {
+  const allowedKeys = [
+    'origin',
+    'source',
+    'forwarded_source',
+    'level',
+    'reason',
+    'exitCode',
+    'exit_code',
+    'type'
+  ]
+  const safeContext: TelemetryContext = {}
+  for (const key of allowedKeys) {
+    const value = context[key]
+    if (!Array.isArray(value)) safeContext[key] = value
+  }
+  const payload = {
+    source: String(
+      safeContext['source'] ?? safeContext['forwarded_source'] ?? 'captured-exception'
+    ),
+    message: 'Desktop application exception',
+    context: safeContext,
+    skipPostHog: true
+  }
+  for (const wc of _telemetryRelayTargets) {
+    if (!wc.isDestroyed()) {
+      try {
+        wc.send('dd-error', payload)
+      } catch {
+        // ignore - telemetry must never break the app
       }
     }
   }
@@ -1287,8 +1364,7 @@ export function forwardToRenderer(event: string, context: TelemetryContext = {})
  * Capture an event and forward it to the renderer in one call.
  */
 export function emit(event: string, context: TelemetryContext = {}): void {
-  capture(event, context)
-  forwardToRenderer(event, context)
+  if (capture(event, context)) forwardToRenderer(event, context)
 }
 
 /**
@@ -1334,7 +1410,7 @@ const SHUTDOWN_DRAIN_TIMEOUT_MS = 1500
  * shutdown, then re-issuing `app.exit()`. A one-shot guard prevents the
  * subsequent quit from re-entering this branch.
  *
- * Safe to call multiple times – the hook only attaches once.
+ * Safe to call multiple times - the hook only attaches once.
  */
 export function installAppHooks(): void {
   if (beforeQuitHooked) return

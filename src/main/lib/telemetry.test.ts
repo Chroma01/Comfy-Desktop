@@ -314,6 +314,10 @@ describe('telemetry.bucketError', () => {
   it('accepts Error instances', () => {
     expect(telemetry.bucketError(new Error('connection timeout'))).toBe('timeout')
   })
+
+  it('uses messages from serialized error objects', () => {
+    expect(telemetry.bucketError({ message: 'ECONNRESET' })).toBe('network')
+  })
 })
 
 describe('telemetry default event properties', () => {
@@ -376,6 +380,21 @@ describe('telemetry default event properties', () => {
       client: 'desktop',
       $process_person_profile: false
     })
+  })
+
+  it('scrubs exception messages, stacks, and properties at the SDK boundary', () => {
+    setupTelemetry({ appVersion: '1.0.0', appEnv: 'prod', bind: 'id' })
+    exceptions.length = 0
+
+    const error = new Error('failed at C:\\Users\\alice\\plugin.py?token=secret123')
+    error.stack = 'Error: failed\n at C:\\Users\\alice\\plugin.py:1:1 github_pat_1234567890123456'
+    telemetry.captureException(error, { account: 'alice@example.com' })
+
+    const capturedError = exceptions[0]!.error as Error
+    expect(capturedError.message).not.toContain('alice')
+    expect(capturedError.message).not.toContain('secret123')
+    expect(capturedError.stack).not.toContain('github_pat_')
+    expect(exceptions[0]!.properties?.account).toBe('[REDACTED]')
   })
 
   it('stamps installation_id (the bound device id) on every captured event', () => {
@@ -553,6 +572,55 @@ describe('telemetry.trackedStep', () => {
     const msg = captured[1]!.properties?.error_message as string
     expect(msg).toContain('[REDACTED]')
     expect(msg).not.toContain('Administrator')
+  })
+
+  it('emits one canonical error for nested steps with failed stage context', async () => {
+    captured.length = 0
+    await expect(
+      telemetry.trackedStep(
+        'migrate.flow',
+        { source_installation_id: 'source-1' },
+        () =>
+          telemetry.trackedStep('migrate.register', { installation_id: 'target-1' }, async () => {
+            throw new Error('disk full')
+          }),
+        { canonicalError: true }
+      )
+    ).rejects.toThrow('disk full')
+    const errors = captured.filter((event) => event.event.endsWith('.error'))
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({
+      event: 'migrate.flow.error',
+      properties: {
+        failed_stage: 'migrate.register',
+        source_installation_id: 'source-1',
+        installation_id: 'target-1'
+      }
+    })
+  })
+
+  it('retains the innermost failure stage through multiple nested steps', async () => {
+    captured.length = 0
+    await expect(
+      telemetry.trackedStep(
+        'flow',
+        {},
+        () =>
+          telemetry.trackedStep('middle', {}, () =>
+            telemetry.trackedStep('inner', { installation_id: 'target-1' }, async () => {
+              throw new Error('disk full')
+            })
+          ),
+        { canonicalError: true }
+      )
+    ).rejects.toThrow('disk full')
+
+    const errors = captured.filter((event) => event.event.endsWith('.error'))
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({
+      event: 'flow.error',
+      properties: { failed_stage: 'inner', installation_id: 'target-1' }
+    })
   })
 })
 
@@ -1014,6 +1082,35 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
     })
   })
 
+  it('forwards exceptions to Datadog without message, stack, or arbitrary context', () => {
+    const target = makeStubWebContents()
+    telemetry.registerTelemetryRelayTarget(target.wc)
+
+    telemetry.forwardExceptionToRenderer({
+      origin: 'renderer',
+      source: 'renderer-window-error',
+      reason: 'crashed',
+      error_message: 'private failure text',
+      error_stack: 'private stack'
+    })
+
+    expect(target.sends).toHaveLength(1)
+    expect(target.sends[0]).toMatchObject({
+      channel: 'dd-error',
+      data: {
+        source: 'renderer-window-error',
+        message: 'Desktop application exception',
+        context: { origin: 'renderer', source: 'renderer-window-error', reason: 'crashed' },
+        skipPostHog: true
+      }
+    })
+    const forwarded = target.sends[0]!.data as Record<string, unknown>
+    const forwardedContext = forwarded['context'] as Record<string, unknown>
+    expect(forwarded).not.toHaveProperty('stack')
+    expect(forwardedContext).not.toHaveProperty('error_message')
+    expect(forwardedContext).not.toHaveProperty('error_stack')
+  })
+
   it('emit() captures via PostHog Node AND forwards to relay targets', () => {
     const a = makeStubWebContents()
     telemetry.registerTelemetryRelayTarget(a.wc)
@@ -1033,6 +1130,22 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
         context: { variant: 'standalone' },
         mainAlreadyCaptured: true
       }
+    })
+  })
+
+  it('only forwards the one-shot warning after the shared session cap is reached', () => {
+    const target = makeStubWebContents()
+    telemetry.registerTelemetryRelayTarget(target.wc)
+    telemetry._test_resetVolumeGuards()
+    for (let i = 0; i < 5000; i++) {
+      telemetry.capture('comfy.desktop.execution.error', { i })
+    }
+
+    telemetry.emit('comfy.desktop.execution.error', { i: 5001 })
+
+    expect(target.sends).toHaveLength(1)
+    expect(target.sends[0]).toMatchObject({
+      data: { event: 'comfy.desktop.telemetry.session_cap_hit', mainAlreadyCaptured: true }
     })
   })
 
@@ -1200,5 +1313,21 @@ describe('telemetry SDK-level volume guards', () => {
     expect(productEvents).toHaveLength(5000)
     expect(sessionCapWarnings).toHaveLength(1)
     expect(sessionCapWarnings[0]?.properties).toMatchObject({ cap: 5000 })
+  })
+
+  it('counts captured exceptions toward the per-process cap', () => {
+    exceptions.length = 0
+    for (let i = 0; i < 4999; i++) {
+      telemetry.capture('comfy.desktop.execution.error', { i })
+    }
+
+    telemetry.captureException(new Error('accepted'))
+    telemetry.captureException(new Error('dropped'))
+
+    expect(exceptions).toHaveLength(1)
+    expect((exceptions[0]!.error as Error).message).toBe('accepted')
+    expect(
+      captured.filter((c) => c.event === 'comfy.desktop.telemetry.session_cap_hit')
+    ).toHaveLength(1)
   })
 })
