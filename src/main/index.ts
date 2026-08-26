@@ -155,6 +155,7 @@ import {
   destroyPanelView,
   ensurePanelView,
   focusActiveBody,
+  prewarmAttachedPanel,
   refreshComfyTabBody,
   registerPanelViewIpc,
   sendToPanelDeferred,
@@ -660,7 +661,7 @@ function onLaunch({
       destroyPanelView(claimed)
       const ok = attachInstall(claimed, { installation, comfyUrl, isLocal: !url })
       if (ok) {
-        claimed.layoutViews()
+        prewarmAttachedPanel(claimed)
         if (proc) {
           proc.on('exit', () => {
             // Session registry handles state cleanup
