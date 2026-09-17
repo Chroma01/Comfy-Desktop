@@ -111,10 +111,10 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 // re-exported by `posthog-node`. Inlining the shape we actually use.
 export type FeatureFlagValue = string | boolean
 
-export interface OpsFlagResult {
-  value: FeatureFlagValue
-  payload: unknown
-}
+/** Every outcome of an ops-flag fetch, classified. See `getOpsFlagResult`. */
+export type OpsFlagFetchResult =
+  | { kind: 'value'; value: FeatureFlagValue; payload: unknown }
+  | { kind: 'unreachable' }
 import {
   DEFAULT_POSTHOG_API_KEY,
   DEFAULT_POSTHOG_HOST,
@@ -1463,6 +1463,40 @@ export async function loadFeatureFlagsImmediate(
   }
 }
 
+/** Taken from the SDK rather than restated, so the in-band and late mappings cannot drift. */
+type PostHogFeatureFlagResult = NonNullable<Awaited<ReturnType<PostHog['getFeatureFlagResult']>>>
+
+function toOpsFlagValue(
+  result: PostHogFeatureFlagResult
+): Extract<OpsFlagFetchResult, { kind: 'value' }> {
+  return {
+    kind: 'value',
+    value: result.enabled ? (result.variant ?? true) : false,
+    payload: result.payload
+  }
+}
+
+/** Observe a fetch the deadline already abandoned, so an explicit value arriving late still
+ *  reaches the caller.
+ *
+ *  Detached on purpose: `getOpsFlagResult` has answered `unreachable` and its caller has moved
+ *  on, so nothing awaits this. It therefore needs its own `.catch` — without one, a rejection
+ *  of an abandoned fetch (or a throwing callback) surfaces as an unhandled rejection.
+ *
+ *  Fires for a TRUTHY resolution only. A falsy resolution means the server returned no result
+ *  for the key, which is `unreachable` and must not be reported as a value: routing it through
+ *  here would make deleting a flag revoke it. */
+function reportLateResult(
+  flagPromise: ReturnType<PostHog['getFeatureFlagResult']>,
+  onLateResult: (result: Extract<OpsFlagFetchResult, { kind: 'value' }>) => void
+): void {
+  void flagPromise
+    .then((late) => {
+      if (late) onLateResult(toOpsFlagValue(late))
+    })
+    .catch(() => {})
+}
+
 /**
  * Fetch a single OPERATIONAL feature flag together with its matched payload.
  *
@@ -1476,20 +1510,37 @@ export async function loadFeatureFlagsImmediate(
  * so an evaluation-only key never creates a PostHog person behind the capture
  * policy.
  *
- * Returns `undefined` when:
- *   - the PostHog client is not yet initialised
- *   - the network call times out or errors
- *   - the flag is missing on the server
- * Callers must choose a safe fallback so a fetch miss never accidentally
- * degrades the product. `makeOpsFlag` (opsFlag.ts) is that wrapper for every
- * current caller.
+ * Classifies every outcome as exactly one `OpsFlagFetchResult`:
+ *   - `value` — the server answered. A disabled flag is a value of `false`,
+ *     NOT a miss, which is what makes disabling the supported way to revoke a
+ *     treatment a client has already persisted.
+ *   - `unreachable` — the client is not initialised, the call timed out or
+ *     threw, or the server returned no result for the key. The treatment is
+ *     unknown FOR THIS LAUNCH rather than withdrawn, so callers hold what they
+ *     had instead of degrading the product on a bad network. A DELETED flag key
+ *     lands here too, which is why deleting a flag does not revoke it — see the
+ *     `persist` option on `makeOpsFlag` (opsFlag.ts), the wrapper every caller
+ *     uses.
+ *
+ * A timeout no longer LOSES the answer, only defers it. A cold `/flags` POST
+ * measured ~2572 ms on Windows and is always cold at boot, so a 2000 ms deadline
+ * lost every launch and an abandoned explicit `false` never reached disk — a
+ * grant could not be withdrawn at all. `onLateResult` reports an explicit value
+ * that arrives after the deadline, so the caller can persist it for the NEXT
+ * launch. The returned classification is unaffected: this launch was already
+ * answered `unreachable` and acts on that.
+ *
+ * Deletion is still not revocation. Only a TRUTHY resolution reaches
+ * `onLateResult`; a late miss (deleted/archived/absent key) and a late rejection
+ * are both `unreachable`, which callers must never persist.
  */
 export async function getOpsFlagResult(
   key: string,
   distinctId: string,
-  timeoutMs: number
-): Promise<OpsFlagResult | undefined> {
-  if (!client) return undefined
+  timeoutMs: number,
+  onLateResult?: (result: Extract<OpsFlagFetchResult, { kind: 'value' }>) => void
+): Promise<OpsFlagFetchResult> {
+  if (!client) return { kind: 'unreachable' }
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const flagPromise = client.getFeatureFlagResult(key, distinctId, {
@@ -1499,13 +1550,16 @@ export async function getOpsFlagResult(
       timer = setTimeout(() => resolve(undefined), timeoutMs)
     })
     const result = await Promise.race([flagPromise, timeoutPromise])
-    if (!result) return undefined
-    return {
-      value: result.enabled ? (result.variant ?? true) : false,
-      payload: result.payload
+    if (!result) {
+      // Either the timer won and `flagPromise` is still in flight, or `flagPromise` itself
+      // resolved with no result for the key. `reportLateResult` fires on a truthy resolution
+      // only, so the second case settles as the no-op it must be.
+      if (onLateResult) reportLateResult(flagPromise, onLateResult)
+      return { kind: 'unreachable' }
     }
+    return toOpsFlagValue(result)
   } catch {
-    return undefined
+    return { kind: 'unreachable' }
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
