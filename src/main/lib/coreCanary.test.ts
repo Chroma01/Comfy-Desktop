@@ -1,8 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
 
 const getOpsFlagResult = vi.fn()
 vi.mock('./telemetry', () => ({
   getOpsFlagResult: (...args: unknown[]) => getOpsFlagResult(...args)
+}))
+
+// `coreCanary` is the one flag that persists, so resolving a value here writes `ops-flags.json`
+// for real — into the developer's own config dir, granting them the canary on their next launch.
+// Pinning `configDir()` to a temp dir is how `opsFlag.test.ts` and `experiments.test.ts` contain
+// that. Set for every test, not just the fetch one: an empty dir would resolve the file relative
+// to cwd and drop it in the repo root.
+let testConfigDir = ''
+vi.mock('./paths', () => ({
+  configDir: () => testConfigDir
 }))
 
 import {
@@ -15,12 +28,18 @@ import {
   selectCoreCanaryArgs
 } from './coreCanary'
 import type { CoreVersionState } from './coreCanary'
-import { coreSemverExact } from './version'
+import { coreRecordCurrent, coreSemverExact, coreSemverVerified } from './version'
+import type { ComfyVersion } from './version'
 import type { InstallationRecord } from '../installations'
 
 beforeEach(() => {
   _resetForTest()
   getOpsFlagResult.mockReset()
+  testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'core-canary-'))
+})
+
+afterEach(() => {
+  fs.rmSync(testConfigDir, { recursive: true, force: true })
 })
 
 describe('parseCoreCanaryFlags', () => {
@@ -180,10 +199,11 @@ describe('selectCoreCanaryArgs', () => {
     maxCoreVersion: '0.4.0'
   }
 
-  /** Defaults to exact: an install sitting on its release tag is the ordinary case, so the
-   *  cases below vary only what they are actually about. */
+  /** Defaults to exact, verified and current: an install sitting on an ancestry-established
+   *  release tag its record still describes is the ordinary case, so the cases below vary only
+   *  what they are actually about. */
   function at(semver: string | null, exact = true): CoreVersionState {
-    return { semver, exact }
+    return { semver, exact, verified: true, current: true }
   }
 
   it.each([
@@ -277,22 +297,132 @@ describe('selectCoreCanaryArgs', () => {
     expect(selectCoreCanaryArgs([unboundedGrant], at(null), true, [])).toEqual([])
   })
 
-  /** Derives exactness the way production does, so these cases pin the real `commitsAhead`
-   *  semantics rather than a hand-set boolean that could drift from `coreSemverExact`. */
-  function exactnessOf(commitsAhead: number | undefined): boolean {
-    const inst: InstallationRecord = {
+  /** An install record carrying exactly the version data under test, so the cases below derive
+   *  their gate inputs from production readers rather than hand-set booleans that could drift. */
+  function installWith(comfyVersion: ComfyVersion): InstallationRecord {
+    return {
       id: 'inst-1',
       name: 'ComfyUI',
       createdAt: '2026-01-01T00:00:00.000Z',
       installPath: '/tmp/comfy',
       sourceId: 'git',
-      comfyVersion: {
-        commit: '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
-        baseTag: 'v0.3.99',
-        commitsAhead
-      }
+      comfyVersion
     }
-    return coreSemverExact(inst)
+  }
+
+  const COMMIT = '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
+
+  it('returns no grants when the base tag was not established by ancestry', () => {
+    // `resolveLocalVersion`'s merge-base fallback runs only because v0.3.99 is NOT an ancestor,
+    // so this install may be missing the fix a raised minimum is asking for.
+    const mergeBaseFallback = installWith({
+      commit: COMMIT,
+      baseTag: 'v0.3.99',
+      commitsAhead: 12,
+      baseTagVerified: false
+    })
+    expect(
+      selectCoreCanaryArgs(
+        [unboundedGrant],
+        {
+          semver: '0.3.99',
+          exact: false,
+          verified: coreSemverVerified(mergeBaseFallback),
+          current: true
+        },
+        true,
+        []
+      )
+    ).toEqual([])
+  })
+
+  it('returns no grants for a legacy record persisted without the verification field', () => {
+    const legacy = installWith({ commit: COMMIT, baseTag: 'v0.3.99', commitsAhead: 0 })
+    expect(
+      selectCoreCanaryArgs(
+        [unboundedGrant],
+        { semver: '0.3.99', exact: true, verified: coreSemverVerified(legacy), current: true },
+        true,
+        []
+      )
+    ).toEqual([])
+  })
+
+  it('returns the grant when the base tag is ancestry-established', () => {
+    const verifiedBase = installWith({
+      commit: COMMIT,
+      baseTag: 'v0.3.99',
+      commitsAhead: 12,
+      baseTagVerified: true
+    })
+    expect(
+      selectCoreCanaryArgs(
+        [unboundedGrant],
+        {
+          semver: '0.3.99',
+          exact: false,
+          verified: coreSemverVerified(verifiedBase),
+          current: true
+        },
+        true,
+        []
+      )
+    ).toEqual([unboundedGrant])
+  })
+
+  const PULLED_COMMIT = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c'
+
+  it('returns no grants when the live checkout has moved off the recorded commit', () => {
+    // A pull after the record was written leaves `exact` and `verified` true of a commit that is
+    // no longer running, so neither of them can refuse this — they are assertions about the
+    // recorded commit, not about the checkout still being at it.
+    const pulled = installWith({
+      commit: COMMIT,
+      baseTag: 'v0.3.99',
+      commitsAhead: 0,
+      baseTagVerified: true
+    })
+    expect(
+      selectCoreCanaryArgs(
+        [unboundedGrant],
+        {
+          semver: '0.3.99',
+          exact: coreSemverExact(pulled),
+          verified: coreSemverVerified(pulled),
+          current: coreRecordCurrent(pulled, { kind: 'head', commit: PULLED_COMMIT })
+        },
+        true,
+        []
+      )
+    ).toEqual([])
+  })
+
+  it('returns the grant when the live checkout is still at the recorded commit', () => {
+    const atRecord = installWith({
+      commit: COMMIT,
+      baseTag: 'v0.3.99',
+      commitsAhead: 0,
+      baseTagVerified: true
+    })
+    expect(
+      selectCoreCanaryArgs(
+        [unboundedGrant],
+        {
+          semver: '0.3.99',
+          exact: coreSemverExact(atRecord),
+          verified: coreSemverVerified(atRecord),
+          current: coreRecordCurrent(atRecord, { kind: 'head', commit: COMMIT })
+        },
+        true,
+        []
+      )
+    ).toEqual([unboundedGrant])
+  })
+
+  /** Derives exactness the way production does, so these cases pin the real `commitsAhead`
+   *  semantics rather than a hand-set boolean that could drift from `coreSemverExact`. */
+  function exactnessOf(commitsAhead: number | undefined): boolean {
+    return coreSemverExact(installWith({ commit: COMMIT, baseTag: 'v0.3.99', commitsAhead }))
   }
 
   it('applies a max-bounded grant when the install sits exactly on its tag', () => {
@@ -324,6 +454,7 @@ describe('selectCoreCanaryArgs', () => {
 describe('core canary fetch', () => {
   it('reads its own PostHog key once at boot', async () => {
     getOpsFlagResult.mockResolvedValue({
+      kind: 'value',
       value: true,
       payload: { flags: [{ arg: '--enable-assets', min_core_version: '0.3.80' }] }
     })

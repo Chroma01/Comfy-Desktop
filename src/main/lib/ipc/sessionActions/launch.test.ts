@@ -544,6 +544,8 @@ const build = (over: {
   betaFlags?: CoreCanaryFlag[]
   coreVersion?: string | null
   coreVersionExact?: boolean
+  coreVersionVerified?: boolean
+  coreVersionCurrent?: boolean
   betaEnabled?: boolean
 }): ReturnType<typeof buildLaunchArgs> =>
   buildLaunchArgs({
@@ -554,6 +556,8 @@ const build = (over: {
     betaFlags: over.betaFlags ?? [ASSETS_GRANT],
     coreVersion: over.coreVersion === undefined ? '0.3.81' : over.coreVersion,
     coreVersionExact: over.coreVersionExact ?? true,
+    coreVersionVerified: over.coreVersionVerified ?? true,
+    coreVersionCurrent: over.coreVersionCurrent ?? true,
     betaEnabled: over.betaEnabled ?? true
   })
 
@@ -599,6 +603,25 @@ describe('buildLaunchArgs core beta injection', () => {
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS])
     expect(built.beta.applied).toEqual([])
     expect(built.beta.logRecords).toEqual([])
+  })
+
+  it("injects nothing when the install's base tag was not established by ancestry", () => {
+    const built = build({ schema: schemaOf('enable-assets'), coreVersionVerified: false })
+
+    expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS])
+    expect(built.beta.applied).toEqual([])
+    expect(built.beta.logRecords).toEqual([])
+    // Refusing the version claim is not the core refusing the arg; telemetry must not conflate them.
+    expect(built.beta.droppedUnsupported).toEqual([])
+  })
+
+  it('injects nothing when the live checkout contradicts the recorded commit', () => {
+    const built = build({ schema: schemaOf('enable-assets'), coreVersionCurrent: false })
+
+    expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS])
+    expect(built.beta.applied).toEqual([])
+    expect(built.beta.logRecords).toEqual([])
+    expect(built.beta.droppedUnsupported).toEqual([])
   })
 
   it('drops a granted arg the running core does not accept, and reports it', () => {
@@ -856,7 +879,8 @@ describe('core beta report placement', () => {
       comfyVersion: {
         commit: '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
         baseTag: 'v0.3.81',
-        commitsAhead: 0
+        commitsAhead: 0,
+        baseTagVerified: true
       }
     }) as unknown as InstallationRecord
 
@@ -934,6 +958,137 @@ describe('core beta report placement', () => {
     expect(sent.join('')).toContain('[core-beta] --enable-assets')
     expect(reportedEvents()).toContain('comfy.desktop.core_beta.applied')
     expect(reportedEvents()).toContain('comfy.desktop.core_beta.opt_state')
+  })
+
+  /** The commit `harnessInstall`'s record names, i.e. what the version gate believes is running. */
+  const RECORDED_COMMIT = '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
+  /** A different commit, as a `git pull` would leave the checkout after the record was written. */
+  const PULLED_COMMIT = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c'
+
+  /** Give the install a git checkout at `sha`, in the detached-HEAD shape `readGitHead` reads.
+   *  Absent by default, which is the standalone/archive install the other cases launch as. */
+  function writeGitHead(sha: string): void {
+    const gitDir = path.join(installDir, 'ComfyUI', '.git')
+    fs.mkdirSync(gitDir, { recursive: true })
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), `${sha}\n`)
+  }
+
+  /** Give the install a git checkout whose HEAD cannot be established: the `.git` directory is
+   *  there, but HEAD is empty. Empty rather than chmod-ed or deleted because it is the one
+   *  shape that reproduces identically on every platform CI runs on, and it is a real state —
+   *  mid-`git pull`, HEAD is rewritten, which is exactly when this gate is asked. */
+  function writeUnreadableGitHead(): void {
+    const gitDir = path.join(installDir, 'ComfyUI', '.git')
+    fs.mkdirSync(gitDir, { recursive: true })
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), '')
+  }
+
+  it('withholds grants when the live checkout has moved off the recorded commit', async () => {
+    // A `git pull` after the record was written leaves `commitsAhead: 0` true of a commit that
+    // is no longer checked out, so `exact` and `verified` both still pass — they are assertions
+    // about the recorded commit, not about the checkout still being at it. Core's args schema
+    // does not cover for that here: a NEWER core still parses `--enable-assets`, so the upper
+    // bound has nothing behind it but the stale record.
+    writeGitHead(PULLED_COMMIT)
+
+    const res = await handleLaunch(ctxFor('harness-record-superseded'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+  })
+
+  it('applies grants when the live checkout is still at the recorded commit', async () => {
+    writeGitHead(RECORDED_COMMIT)
+
+    const res = await handleLaunch(ctxFor('harness-record-current'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-assets')
+  })
+
+  it('applies grants to a standalone install, which has no HEAD to contradict the record', async () => {
+    // No `.git` at all: `readGitHead` returns null and there is no contradiction to observe, so
+    // the record stands. Archive installs are the majority of Desktop — they must not lose
+    // grants to a check that only git checkouts can answer.
+    expect(fs.existsSync(path.join(installDir, 'ComfyUI', '.git'))).toBe(false)
+
+    const res = await handleLaunch(ctxFor('harness-standalone-no-git'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-assets')
+  })
+
+  it('withholds grants when the install is git-managed but its HEAD cannot be read', async () => {
+    // Between "no git" and "HEAD says X" sits a third state: a git checkout whose HEAD we could
+    // not establish. Collapsing it into the no-git case grants on it, which inverts the gate —
+    // an unreadable HEAD is most likely mid-pull, i.e. precisely the move this check exists to
+    // catch. The `.git` directory is the observable difference from the standalone case.
+    writeUnreadableGitHead()
+
+    const res = await handleLaunch(ctxFor('harness-git-head-unreadable'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+  })
+
+  it('withholds grants when .git is a pointer file the git dir cannot be resolved from', async () => {
+    // One layer below the unreadable-HEAD case: `.git` exists, so this IS a git-managed
+    // checkout, but it is a worktree/submodule pointer with no `gitdir:` line, so there is no
+    // git directory to read a HEAD out of. Classifying that as "not a git install" — which is
+    // what a bare `resolveGitDir() === null` check does — hands it the standalone install's
+    // unconditional grant, on a checkout whose commit was never established.
+    const dotGit = path.join(installDir, 'ComfyUI', '.git')
+    fs.writeFileSync(dotGit, 'this file is not a gitdir pointer\n')
+
+    const res = await handleLaunch(ctxFor('harness-git-pointer-unresolvable'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+  })
+
+  it('withholds grants when .git is a dangling symlink', async () => {
+    // The case that forces `lstat` over `stat`: `stat` follows the link, finds nothing, and
+    // raises ENOENT — indistinguishable from an install that never had a `.git` at all, so the
+    // checkout is waved through as standalone. `lstat` sees the link itself, and a link
+    // pointing at a missing git dir is a broken checkout, not an absent one.
+    const dotGit = path.join(installDir, 'ComfyUI', '.git')
+    try {
+      fs.symlinkSync(path.join(installDir, 'no-such-git-dir'), dotGit)
+    } catch {
+      // Windows without Developer Mode / SeCreateSymbolicLink cannot create one at all.
+      return
+    }
+    expect(fs.existsSync(dotGit)).toBe(false) // `stat`-based existence says "absent"
+
+    const res = await handleLaunch(ctxFor('harness-git-dangling-symlink'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+  })
+
+  it('withholds grants when the .git entry cannot be stat-ed at all', async () => {
+    // The third way `.git` resolution fails: the entry is neither absent nor readable — an
+    // EACCES/EPERM/ELOOP on the `lstat` itself. No portable way to produce that on a real
+    // filesystem (a chmod-ed parent does nothing when the suite runs as root, and Windows has
+    // no equivalent), so the error is injected at the one syscall that classifies it. Every
+    // other path stays real.
+    const realLstatSync = fs.lstatSync
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((target: fs.PathLike, opts?: object) => {
+      if (String(target).endsWith(`${path.sep}.git`)) {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+      }
+      return realLstatSync(target, opts as never)
+    }) as typeof fs.lstatSync)
+
+    const res = await handleLaunch(ctxFor('harness-git-stat-indeterminate'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
   })
 
   it('continues a skip-port launch when renderer reporting throws', async () => {

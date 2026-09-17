@@ -98,7 +98,9 @@ import type { PersistedTorchStack } from '../../../sources/standalone/torchStack
 import type { WriteStream } from 'fs'
 import { getCoreCanaryFlagsAsync, selectCoreCanaryArgs } from '../../coreCanary'
 import type { CoreCanaryFlag } from '../../coreCanary'
-import { coreSemver, coreSemverExact } from '../../version'
+import { coreRecordCurrent, coreSemver, coreSemverExact, coreSemverVerified } from '../../version'
+import type { CoreCheckout } from '../../version'
+import { gitDirPresence, readGitHead, resolveGitDir } from '../../git'
 import type { ComfyArgsSchema } from '../../comfy-args'
 
 // Feature flags injected on a spawned ComfyUI, gated by the running install's
@@ -119,6 +121,29 @@ export function desktopFeatureFlags(
     flags.enable_telemetry = 'true'
   }
   return flags
+}
+
+/** Establish what the launching checkout is, failing closed at every step, because each step
+ *  has an absence meaning "we could not look" alongside the one meaning "there is nothing here".
+ *  Exactly one state is the latter: no `.git` entry at all, i.e. the standalone/archive install
+ *  with nothing to contradict the record. A `.git` that cannot be stat-ed, one that yields no
+ *  git directory (a worktree/submodule pointer missing its `gitdir:` line), and a git directory
+ *  whose HEAD would not read are all git-managed checkouts we failed to inspect.
+ *  {@link coreRecordCurrent} grants on `not-git` and refuses `unreadable`, so collapsing any of
+ *  the three into it — as a bare `readGitHead` call does, and as a bare `resolveGitDir(…) ===
+ *  null` test does one layer below that — is what made the gate fail open. */
+function resolveCoreCheckout(comfyuiDir: string): CoreCheckout {
+  switch (gitDirPresence(comfyuiDir)) {
+    case 'absent':
+      return { kind: 'not-git' }
+    case 'indeterminate':
+      return { kind: 'unreadable' }
+    case 'present': {
+      if (resolveGitDir(comfyuiDir) === null) return { kind: 'unreadable' }
+      const head = readGitHead(comfyuiDir)
+      return head === null ? { kind: 'unreadable' } : { kind: 'head', commit: head }
+    }
+  }
 }
 
 /** The single post-filter view of this launch's Core beta grants: what survived
@@ -171,13 +196,20 @@ export function buildLaunchArgs(input: {
   betaFlags: readonly CoreCanaryFlag[]
   coreVersion: string | null
   coreVersionExact: boolean
+  coreVersionVerified: boolean
+  coreVersionCurrent: boolean
   betaEnabled: boolean
 }): { args: string[]; beta: CoreBetaLaunch } {
   const { prefixArgs, userArgs, desktopFlagArgs, schema, coreVersion } = input
   const filtered = filterUnsupportedArgs([...userArgs], schema)
   const selected = selectCoreCanaryArgs(
     input.betaFlags,
-    { semver: coreVersion, exact: input.coreVersionExact },
+    {
+      semver: coreVersion,
+      exact: input.coreVersionExact,
+      verified: input.coreVersionVerified,
+      current: input.coreVersionCurrent
+    },
     input.betaEnabled,
     userArgs
   )
@@ -954,6 +986,10 @@ async function runLaunch(
           betaFlags: await getCoreCanaryFlagsAsync(),
           coreVersion: coreSemver(inst),
           coreVersionExact: coreSemverExact(inst),
+          coreVersionVerified: coreSemverVerified(inst),
+          // Read here rather than reused from `revision` above: that one falls back to the
+          // record when HEAD is unreadable, which is the very disagreement being checked for.
+          coreVersionCurrent: coreRecordCurrent(inst, resolveCoreCheckout(path.dirname(mainPyAbs))),
           betaEnabled
         })
         launchCmd.args = built.args
