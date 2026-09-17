@@ -128,6 +128,8 @@ vi.mock('../../hardwareTap', async (importOriginal) => {
 })
 
 import {
+  attachLaunchStreams,
+  createAssetsTapSafe,
   buildLaunchArgs,
   desktopFeatureFlags,
   emitCoreBetaRecords,
@@ -138,8 +140,12 @@ import {
   writeLog,
   _cleanupFailedLaunchSetup
 } from './launch'
+import * as assetsTapModule from '../../assetsTap'
 import type { ActionContext } from './types'
 import type * as ComfyDownloadManagerModule from '../../comfyDownloadManager'
+import type { createExecutionTap } from '../../executionTap'
+import type { createHardwareTap } from '../../hardwareTap'
+import type { LaunchProgressTracker } from '../../launchProgress'
 import type { ComfyArgsSchema } from '../../comfy-args'
 import type { CoreCanaryFlag } from '../../coreCanary'
 import * as telemetry from '../../telemetry'
@@ -370,6 +376,148 @@ describe('handleLaunch model-download startup await (#1322)', () => {
     modelStartup.impl = async () => ({ safe: false, unsafePaths: [] })
     await handleLaunch(ctxFor('gate-slot-release'))
     expect(_operationAborts.has('gate-slot-release')).toBe(false)
+  })
+})
+
+describe('createAssetsTapSafe', () => {
+  const BASE = {
+    installationId: 'assets-tap-base',
+    variant: 'nvidia',
+    release: '0.3.68',
+    coreBetaFlags: ['--enable-assets']
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('forwards the launch-gated core-beta flags with the base context', () => {
+    const create = vi.spyOn(assetsTapModule, 'createAssetsTap')
+    createAssetsTapSafe(BASE)
+    expect(create).toHaveBeenCalledWith({
+      installationId: 'assets-tap-base',
+      variant: 'nvidia',
+      release: '0.3.68',
+      coreBetaFlags: ['--enable-assets']
+    })
+  })
+
+  it('hands back the constructed tap when construction succeeds', () => {
+    const real = { ingest: vi.fn(), beginBoot: vi.fn(), flushSummary: vi.fn() }
+    vi.spyOn(assetsTapModule, 'createAssetsTap').mockReturnValue(real)
+    expect(createAssetsTapSafe(BASE)).toBe(real)
+  })
+
+  it('substitutes an inert tap when construction throws, letting no exception escape', () => {
+    vi.spyOn(assetsTapModule, 'createAssetsTap').mockImplementation(() => {
+      throw new Error('assets tap construction exploded')
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    let tap: ReturnType<typeof createAssetsTapSafe> | null = null
+    expect(() => {
+      tap = createAssetsTapSafe(BASE)
+    }).not.toThrow()
+    expect(consoleError).toHaveBeenCalled()
+
+    // Every lifecycle call the launch path makes must be a safe no-op on the
+    // substitute, or containment at construction buys nothing.
+    const inert = tap as unknown as ReturnType<typeof createAssetsTapSafe>
+    expect(() => {
+      inert.beginBoot()
+      inert.ingest('[assets-event] assets.enabled hashing_enabled=true\n', 'stdout')
+      inert.ingest(
+        '[assets-event] scanner.stat_failed error_type=OSError site=discovery\n',
+        'stderr'
+      )
+      inert.flushSummary()
+    }).not.toThrow()
+  })
+})
+
+describe('attachLaunchStreams assets tap wiring', () => {
+  function fakeTap() {
+    return { ingest: vi.fn(), beginBoot: vi.fn(), flushSummary: vi.fn() }
+  }
+
+  function harness(assetsTap = fakeTap()) {
+    const stdout = new EventEmitter()
+    const stderr = new EventEmitter()
+    const proc = { stdout, stderr } as unknown as ChildProcess
+    const logStream = { writableEnded: false, write: vi.fn() } as unknown as WriteStream
+    const execTap = fakeTap()
+    const hwTap = fakeTap()
+    const tracker = { ingest: vi.fn() } as unknown as LaunchProgressTracker
+    const sendOutput = vi.fn()
+
+    const { getStderr } = attachLaunchStreams(
+      proc,
+      logStream,
+      sendOutput,
+      execTap as unknown as ReturnType<typeof createExecutionTap>,
+      hwTap as unknown as ReturnType<typeof createHardwareTap>,
+      assetsTap,
+      tracker
+    )
+    return { stdout, stderr, execTap, hwTap, assetsTap, getStderr }
+  }
+
+  it('feeds stdout chunks to the assets tap tagged as stdout', () => {
+    const h = harness()
+    h.stdout.emit('data', Buffer.from('[assets-event] assets.enabled hashing_enabled=true\n'))
+    expect(h.assetsTap.ingest).toHaveBeenCalledWith(
+      '[assets-event] assets.enabled hashing_enabled=true\n',
+      'stdout'
+    )
+  })
+
+  it('feeds stderr chunks to the assets tap tagged as stderr', () => {
+    const h = harness()
+    h.stderr.emit(
+      'data',
+      Buffer.from('[assets-event] scanner.stat_failed error_type=OSError site=discovery\n')
+    )
+    expect(h.assetsTap.ingest).toHaveBeenCalledWith(
+      '[assets-event] scanner.stat_failed error_type=OSError site=discovery\n',
+      'stderr'
+    )
+  })
+
+  it('leaves the hardware and execution taps receiving both streams unchanged', () => {
+    const h = harness()
+    h.stdout.emit('data', Buffer.from('out\n'))
+    h.stderr.emit('data', Buffer.from('err\n'))
+    for (const tap of [h.execTap, h.hwTap]) {
+      expect(tap.ingest).toHaveBeenCalledWith('out\n', 'stdout')
+      expect(tap.ingest).toHaveBeenCalledWith('err\n', 'stderr')
+    }
+    expect(h.getStderr()).toBe('err\n')
+  })
+
+  it('keeps piping both streams when the inert substitute tap is attached', () => {
+    vi.spyOn(assetsTapModule, 'createAssetsTap').mockImplementation(() => {
+      throw new Error('assets tap construction exploded')
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const inert = createAssetsTapSafe({
+        installationId: 'inert',
+        variant: null,
+        release: null,
+        coreBetaFlags: []
+      })
+      const h = harness(inert as unknown as ReturnType<typeof fakeTap>)
+      expect(() => {
+        h.stdout.emit('data', Buffer.from('out\n'))
+        h.stderr.emit('data', Buffer.from('err\n'))
+      }).not.toThrow()
+      expect(h.execTap.ingest).toHaveBeenCalledWith('out\n', 'stdout')
+      expect(h.hwTap.ingest).toHaveBeenCalledWith('err\n', 'stderr')
+      expect(h.getStderr()).toBe('err\n')
+    } finally {
+      consoleError.mockRestore()
+      vi.restoreAllMocks()
+    }
   })
 })
 
@@ -788,6 +936,104 @@ describe('core beta report placement', () => {
     expect(reportedEvents()).toContain('comfy.desktop.core_beta.opt_state')
   })
 
+  it('continues a skip-port launch when renderer reporting throws', async () => {
+    const ctx = ctxFor('harness-skip-port-report-throws')
+    const send = ctx.event.sender.send.bind(ctx.event.sender)
+    ctx.event.sender.send = vi.fn((channel: string, payload: { text?: string }) => {
+      if (payload.text?.startsWith('[core-beta]')) throw new Error('renderer unavailable')
+      send(channel, payload)
+    })
+
+    const res = await handleLaunch(ctx)
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-assets')
+    expect(reportedEvents()).toContain('comfy.desktop.core_beta.applied')
+    expect(reportedEvents()).toContain('comfy.desktop.core_beta.opt_state')
+  })
+
+  it('continues a skip-port launch when beta telemetry reporting throws', async () => {
+    vi.mocked(telemetry.emit).mockImplementation((event) => {
+      if (event === 'comfy.desktop.core_beta.applied') throw new Error('sink unavailable')
+    })
+
+    const res = await handleLaunch(ctxFor('harness-skip-port-telemetry-throws'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-assets')
+    expect(sent.join('')).toContain('[core-beta] --enable-assets')
+  })
+
+  it.each([
+    ['supported grant only', true, [HARNESS_GRANT], ['--enable-assets']],
+    [
+      'mixed supported and unsupported grants',
+      true,
+      [HARNESS_GRANT, { arg: '--enable-asset-hashing', minCoreVersion: '0.3.80' }],
+      ['--enable-assets']
+    ],
+    ['revoked grant', true, [], []],
+    ['beta opt-out', false, [HARNESS_GRANT], []],
+    ['outside version window', true, [{ ...HARNESS_GRANT, minCoreVersion: '0.3.82' }], []]
+  ])('attributes assets events to %s', async (_name, optedIn, grants, expected) => {
+    launchHarness.betaEnabled = optedIn
+    launchHarness.grants = grants
+    launchHarness.launchCommand!.args = [
+      '-s',
+      path.join(installDir, 'ComfyUI', 'main.py'),
+      '--listen'
+    ]
+    const child = fakeChild()
+    launchHarness.spawn = (_cmd, args) => {
+      spawnArgs = args as string[]
+      return child
+    }
+
+    const res = await handleLaunch(ctxFor(`harness-assets-context-${_name}`))
+    expect(res.ok).toBe(true)
+    child.stdout.emit('data', Buffer.from('[assets-event] assets.enabled hashing_enabled=false\n'))
+
+    const assetsEvents = events.filter(
+      (e) => e.event === 'comfy.desktop.comfyui.assets.assets.enabled'
+    )
+    expect(assetsEvents).toHaveLength(1)
+    expect(assetsEvents[0]!.properties).toMatchObject({ core_beta_flags: expected })
+    expect(
+      spawnArgs.filter((arg) => arg === '--enable-assets' || arg === '--enable-asset-hashing')
+    ).toEqual(expected)
+  })
+
+  // Assets can now run without the canary having granted anything, so attribution must report what
+  // the canary applied rather than what is on the command line — otherwise a self-enrolled user
+  // lands inside the cohort and skews the soak denominator.
+  it("reports no beta flags when assets run from the user's own argument", async () => {
+    launchHarness.betaEnabled = false
+    launchHarness.grants = []
+    launchHarness.launchCommand!.args = [
+      '-s',
+      path.join(installDir, 'ComfyUI', 'main.py'),
+      '--listen',
+      '--enable-assets'
+    ]
+    const child = fakeChild()
+    launchHarness.spawn = (_cmd, args) => {
+      spawnArgs = args as string[]
+      return child
+    }
+
+    const res = await handleLaunch(ctxFor('harness-assets-context-user-owned'))
+    expect(res.ok).toBe(true)
+    child.stdout.emit('data', Buffer.from('[assets-event] assets.enabled hashing_enabled=false\n'))
+
+    expect(spawnArgs).toContain('--enable-assets')
+
+    const assetsEvents = events.filter(
+      (e) => e.event === 'comfy.desktop.comfyui.assets.assets.enabled'
+    )
+    expect(assetsEvents).toHaveLength(1)
+    expect(assetsEvents[0]!.properties).toMatchObject({ core_beta_flags: [] })
+  })
+
   it.each([
     ['schema', true, false],
     ['feature registry', false, true]
@@ -886,7 +1132,7 @@ describe('core beta report placement', () => {
     expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.opt_state')
   })
 
-  it('reports exactly once when a port conflict retries the spawn', async () => {
+  it('reports once and drains both assets tails before a port-conflict retry without resetting caps', async () => {
     // The only test that proves the latch: the report site lives INSIDE the recursing
     // `tryLaunch`, so an unlatched report fires once per attempt.
     const children: FakeChild[] = []
@@ -899,6 +1145,14 @@ describe('core beta report placement', () => {
       port: 48232
     }
     launchHarness.spawn = () => {
+      if (children.length === 1) {
+        expect(
+          events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.assets.enabled')
+        ).toHaveLength(1)
+        expect(
+          events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.scanner.stat_failed')
+        ).toHaveLength(1)
+      }
       const child = fakeChild()
       children.push(child)
       return child
@@ -910,6 +1164,15 @@ describe('core beta report placement', () => {
       // from here is deterministic — no racing the stream/exit handler registration.
       const first = children[0]!
       first.stderr.emit('data', Buffer.from('OSError: [Errno 98] Address already in use\n'))
+      first.stdout.emit(
+        'data',
+        Buffer.from('[assets-event] seeder.scan_started root=models\n'.repeat(60))
+      )
+      first.stdout.emit('data', Buffer.from('[assets-event] assets.enabled hashing_enabled=true'))
+      first.stderr.emit(
+        'data',
+        Buffer.from('[assets-event] scanner.stat_failed error_type=OSError site=discovery')
+      )
       first.emit('close', 1, null)
       return new Promise<void>(() => {})
     }
@@ -921,6 +1184,13 @@ describe('core beta report placement', () => {
     expect(children).toHaveLength(2)
     expect(events.filter((e) => e.event === 'comfy.desktop.core_beta.opt_state')).toHaveLength(1)
     expect(sent.join('').match(/\[core-beta\]/g) ?? []).toHaveLength(1)
+    children[1]!.stdout.emit(
+      'data',
+      Buffer.from('[assets-event] seeder.scan_started root=models\n')
+    )
+    expect(
+      events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.seeder.scan_started')
+    ).toHaveLength(60)
   })
 
   it('still filters user args, injecting nothing, when the beta setting cannot be resolved', async () => {
