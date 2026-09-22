@@ -27,16 +27,22 @@ describe('useBetaActivationNotice copy resolution', () => {
       isLoadingLockdown: ref(false),
       anchorRef: shallowRef(anchor),
       isSuppressed: () => false,
-      title: copy,
-      body: copy,
-      dismissLabel: copy,
-      actionLabel: copy
+      copyFor: () => ({
+        title: copy(),
+        body: copy(),
+        dismissLabel: copy(),
+        actionLabel: copy()
+      })
     })
   }
 
   beforeEach(() => {
     ;(window as unknown as { api: unknown }).api = {
-      getPendingBetaNotice: vi.fn().mockResolvedValue(['--enable-assets']),
+      getPendingBetaNotice: vi.fn().mockResolvedValue({
+        args: ['--enable-assets'],
+        direction: 'enabled',
+        description: null
+      }),
       acknowledgeBetaNotice: vi.fn().mockResolvedValue(undefined),
       openGlobalSettings: vi.fn()
     }
@@ -73,9 +79,11 @@ describe('useBetaActivationNotice copy resolution', () => {
     // The user switches language, then a second grant clears its version gate.
     translated = 'second-language'
     notice.forgetWithoutAcknowledging()
-    ;(window.api.getPendingBetaNotice as ReturnType<typeof vi.fn>).mockResolvedValue([
-      '--enable-something-else'
-    ])
+    ;(window.api.getPendingBetaNotice as ReturnType<typeof vi.fn>).mockResolvedValue({
+      args: ['--enable-something-else'],
+      direction: 'enabled',
+      description: null
+    })
     await notice.maybeShow()
 
     expect(showCoachmark).toHaveBeenCalledTimes(2)

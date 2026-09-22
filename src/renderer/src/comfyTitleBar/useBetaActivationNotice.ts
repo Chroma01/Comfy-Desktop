@@ -1,7 +1,14 @@
 import { ref, type Ref, type ShallowRef } from 'vue'
+import type { BetaActivationNotice } from '../types/ipc'
 
 /** The Settings row the notice's link flashes — the beta opt-in switch itself, so the
- *  "turn it off" the copy promises is the thing under the user's cursor when Settings opens. */
+ *  "turn it off" the copy promises is the thing under the user's cursor when Settings opens.
+ *
+ *  Deliberately the same target for a withdrawal card. Turning this switch off drops every
+ *  grant including a `--disable-*` one, so it would restore the feature the card just said was
+ *  withdrawn — but the card only offers to "manage beta features", which is exactly what this
+ *  row does. Pointing a withdrawal somewhere else would mean inventing a second destination
+ *  for a path that no shipped core can reach yet. */
 export const BETA_FEATURES_FIELD_ID = 'betaFeaturesEnabled'
 
 interface BetaNoticeBridge {
@@ -35,16 +42,20 @@ interface UseBetaActivationNoticeOpts {
   anchorRef: Readonly<ShallowRef<HTMLElement | null>>
   /** True while another card owns the single popup (currently the pill hint). */
   isSuppressed: () => boolean
-  /** Card copy, resolved by the caller at show time rather than passed as strings.
+  /** Copy for the card main actually resolved. A callback rather than fixed strings because
+   *  the wording depends on the notice: the PostHog payload may name the feature, and a
+   *  remote force-off reads the opposite way from an activation. i18n stays with the caller.
    *
-   *  Lazy deliberately: the title bar's i18n instance starts in English and `syncLocale()`
-   *  does not run until mount, so anything read during setup is an English snapshot that
-   *  never updates — wrong copy for a non-English user, and permanently wrong for every
-   *  later card in this renderer. Called when the card is built instead. */
-  title: () => string
-  body: () => string
-  dismissLabel: () => string
-  actionLabel: () => string
+   *  Being a callback also keeps the copy lazy, which is load-bearing on its own: the title
+   *  bar's i18n instance starts in English and `syncLocale()` does not run until mount, so
+   *  anything read during setup is an English snapshot that never updates — wrong for a
+   *  non-English user, and permanently wrong for every later card in this renderer. */
+  copyFor: (notice: BetaActivationNotice) => {
+    title: string
+    body: string
+    dismissLabel: string
+    actionLabel: string
+  }
 }
 
 interface BetaActivationNoticeApi {
@@ -123,16 +134,27 @@ export function useBetaActivationNotice(
     )
   }
 
-  /** The args main is holding for this install, or `[]`. Returned rather than reduced to a
-   *  boolean because the args are the card's identity — see `retiredKeys`. */
-  async function pendingArgs(installationId: string): Promise<string[]> {
+  /** The card main is holding for this install, or `null`.
+   *
+   *  Takes the id rather than re-reading it, so it cannot disagree with the one `maybeShow`
+   *  captured and validated. Validates `direction` against its two literals: an unrecognised
+   *  value would otherwise fall through to `copyFor`, whose `=== 'disabled'` test would then
+   *  silently pick the "is on" wording for a withdrawal. */
+  async function pendingNotice(installationId: string): Promise<BetaActivationNotice | null> {
     try {
       const pending = await window.api.getPendingBetaNotice(installationId)
-      return Array.isArray(pending) ? pending.filter((a) => typeof a === 'string') : []
+      if (!pending || !Array.isArray(pending.args) || pending.args.length === 0) return null
+      if (pending.direction !== 'enabled' && pending.direction !== 'disabled') return null
+      const description = typeof pending.description === 'string' ? pending.description : null
+      return {
+        args: pending.args.filter((a) => typeof a === 'string'),
+        direction: pending.direction,
+        description
+      }
     } catch {
       // Read failed; stay silent. Unlike the pill hint's "treat as unseen", guessing wrong
       // here would announce a beta feature that may not be on at all.
-      return []
+      return null
     }
   }
 
@@ -165,26 +187,27 @@ export function useBetaActivationNotice(
    *  in-flight claim across the whole thing without a `try` nested in the guards. */
   async function showIfPending(installationId: string): Promise<void> {
     if (!opts.bridge) return
-    const args = await pendingArgs(installationId)
-    if (args.length === 0) return
-    const key = noticeKey(installationId, args)
+    const notice = await pendingNotice(installationId)
+    if (!notice) return
+    const key = noticeKey(installationId, notice.args)
     if (retiredKeys.has(key)) return
     // Re-check after the await; the host could have flipped state or the pill hint could have
     // claimed the popup while we were asking.
     const anchor = opts.anchorRef.value
     if (!gatePasses() || !anchor || opts.installationId() !== installationId) return
 
+    const copy = opts.copyFor(notice)
     const rect = anchor.getBoundingClientRect()
     shownForInstall = installationId
     shownKey = key
-    shownArgs = args
+    shownArgs = notice.args
     isShowing.value = true
     opts.bridge.showCoachmark({
       kind: 'beta-notice',
-      title: opts.title(),
-      body: opts.body(),
-      dismissLabel: opts.dismissLabel(),
-      actionLabel: opts.actionLabel(),
+      title: copy.title,
+      body: copy.body,
+      dismissLabel: copy.dismissLabel,
+      actionLabel: copy.actionLabel,
       leftX: Math.round(rect.left),
       rightX: Math.round(rect.right),
       bottomY: Math.round(rect.bottom)
