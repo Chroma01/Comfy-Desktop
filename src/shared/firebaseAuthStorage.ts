@@ -9,7 +9,11 @@
  * ## The rule — THREE outcomes, not two
  *
  *     localStorage holds a record            -> AUTHORITATIVE. Any IndexedDB copy is the drained one.
- *     both stores hold nothing               -> signed out. Unambiguous.
+ *     both stores hold nothing               -> signed out — but the monitor reports it only once
+ *                                               that state has PERSISTED (a wall-clock settle), so
+ *                                               a transient both-empty during a persistence move is
+ *                                               not a sign-out. Unambiguous as a state, not instant
+ *                                               as a report.
  *     localStorage readable but EMPTY,
  *       while IndexedDB holds a user         -> ABSTAIN: `pending` / `{known: false}`. Not a verdict.
  *
@@ -129,6 +133,13 @@
  *  prefix, and never log or persist a whole key. */
 export const FIREBASE_AUTH_KEY_PREFIX = 'firebase:authUser:'
 
-/** The legacy IndexedDB persistence. Read ONLY when localStorage is unavailable — see the rule. */
+/** The other Firebase persistence — not a legacy one. It holds the live user through boot on the
+ *  released frontend, and is consulted when localStorage is readable and EMPTY as well as when the
+ *  localStorage mechanism is absent. A THROWING IndexedDB abstains in both readers. An ABSENT one
+ *  does not: the monitor then reports `signed_out` for an empty localStorage, because a genuinely
+ *  signed-out user has to reach that state, while `CLASSIFY_STAFF_JS` abstains because it never
+ *  needs to assert a sign-out - the same asymmetry, and the same reason, as the missing-database
+ *  row above. "Read only when localStorage is unavailable" was this file's own earlier wording and
+ *  is withdrawn: see the rule above. */
 export const FIREBASE_IDB_NAME = 'firebaseLocalStorageDb'
 export const FIREBASE_IDB_STORE = 'firebaseLocalStorage'
