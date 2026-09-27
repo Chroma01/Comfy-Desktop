@@ -20,8 +20,16 @@ import {
   createPerformanceTestResultsSvg,
   type PerformanceTestImageMetric
 } from '../lib/performanceTestResultsSvg'
+import { emitTelemetryAction } from '../lib/telemetry'
 import DevPlatformAccountChip from './devplatform/DevPlatformAccountChip.vue'
 import DevPlatformWorkspaceSelector from './devplatform/DevPlatformWorkspaceSelector.vue'
+
+interface PerformanceTestRunTelemetry {
+  readonly installationId: string
+  readonly warmupRuns: number
+  readonly measuredRuns: number
+  readonly startedAtMs: number
+}
 
 const { t } = useI18n()
 const authStore = useAuthStore()
@@ -133,6 +141,7 @@ const canStop = computed(() => {
   return Boolean(performanceTestInstallationId.value && !isStopping.value)
 })
 let activeLaunchPromise: Promise<ActionResult> | null = null
+let activeRunTelemetry: PerformanceTestRunTelemetry | null = null
 let runToken = 0
 const unsubscribePerformanceTestProgress = window.api.onPerformanceTestProgress((progress) => {
   if (progress.sessionId !== progressSessionId.value) return
@@ -166,6 +175,10 @@ function correctWarmupRuns(): void {
 
 function correctMeasuredRuns(): void {
   measuredRuns.value = correctRunCount(measuredRuns.value, 1, 100, 5)
+}
+
+function secondsToMilliseconds(seconds: number | null | undefined): number | null {
+  return seconds == null ? null : seconds * 1000
 }
 
 async function importWorkflow(sourcePath?: string): Promise<void> {
@@ -227,6 +240,19 @@ async function runPerformanceTest(): Promise<void> {
   const runs = Number(measuredRuns.value)
   const sessionId = performanceTestSessionId(installationId)
   const token = ++runToken
+  const runTelemetry: PerformanceTestRunTelemetry = {
+    installationId,
+    warmupRuns: warmups,
+    measuredRuns: runs,
+    startedAtMs: performance.now()
+  }
+  activeRunTelemetry = runTelemetry
+  emitTelemetryAction('comfy.desktop.performance_test.started', {
+    installation_id: installationId,
+    warmup_runs: warmups,
+    measured_runs: runs,
+    total_runs: warmups + runs
+  })
   isLaunching.value = true
   performanceTestResult.value = null
   progressSessionId.value = sessionId
@@ -270,6 +296,48 @@ async function runPerformanceTest(): Promise<void> {
       )
       if (submission.ok) {
         performanceTestResult.value = submission
+        if (activeRunTelemetry === runTelemetry) {
+          activeRunTelemetry = null
+          const summary = submission.resultsSummary
+          const statistics = submission.statistics
+          const hardware = submission.hardware
+          emitTelemetryAction('comfy.desktop.performance_test.completed', {
+            installation_id: runTelemetry.installationId,
+            warmup_runs: runTelemetry.warmupRuns,
+            measured_runs: runTelemetry.measuredRuns,
+            successful_runs:
+              summary?.measuredJobCount ??
+              statistics?.measuredJobCount ??
+              Math.max(0, submission.submitted - (submission.failedRuns ?? 0)),
+            failed_runs: summary?.failedRunCount ?? submission.failedRuns ?? 0,
+            duration_ms: performance.now() - runTelemetry.startedAtMs,
+            fastest_run_duration_ms: secondsToMilliseconds(
+              summary?.fastestJobDurationSeconds ?? statistics?.fastest.durationSeconds
+            ),
+            average_run_duration_ms: secondsToMilliseconds(
+              summary?.averageJobDurationSeconds ?? statistics?.averageDurationSeconds
+            ),
+            median_run_duration_ms: secondsToMilliseconds(
+              summary?.medianJobDurationSeconds ?? statistics?.medianDurationSeconds
+            ),
+            slowest_run_duration_ms: secondsToMilliseconds(
+              summary?.slowestJobDurationSeconds ?? statistics?.slowest.durationSeconds
+            ),
+            deviceType: hardware?.deviceType ?? null,
+            deviceIndex: hardware?.deviceIndex ?? null,
+            deviceName: hardware?.deviceName ?? null,
+            backend: hardware?.backend ?? null,
+            devicesDeviceType: hardware?.devices.map((device) => device.deviceType) ?? [],
+            devicesDeviceIndex: hardware?.devices.map((device) => device.deviceIndex) ?? [],
+            devicesDeviceName: hardware?.devices.map((device) => device.deviceName) ?? [],
+            devicesBackend: hardware?.devices.map((device) => device.backend) ?? [],
+            vramMb: hardware?.vramMb ?? null,
+            ramMb: hardware?.ramMb ?? null,
+            pytorchVersion: hardware?.pytorchVersion ?? null,
+            xformersVersion: hardware?.xformersVersion ?? null,
+            cudaDeviceSet: hardware?.cudaDeviceSet ?? null
+          })
+        }
       }
       sessionStore.appendOutput(
         sessionId,
@@ -307,6 +375,7 @@ async function runPerformanceTest(): Promise<void> {
       }
     }
     activeLaunchPromise = null
+    if (activeRunTelemetry === runTelemetry) activeRunTelemetry = null
     progressSessionId.value = null
     isLaunching.value = false
   }
@@ -454,6 +523,22 @@ async function stopPerformanceTest(): Promise<void> {
   }
 }
 
+async function stopPerformanceTestFromUser(): Promise<void> {
+  const telemetry = activeRunTelemetry
+  if (telemetry) {
+    activeRunTelemetry = null
+    emitTelemetryAction('comfy.desktop.performance_test.stopped', {
+      installation_id: telemetry.installationId,
+      warmup_runs: telemetry.warmupRuns,
+      measured_runs: telemetry.measuredRuns,
+      completed_runs: completedProgressRuns.value,
+      total_runs: telemetry.warmupRuns + telemetry.measuredRuns,
+      duration_ms: performance.now() - telemetry.startedAtMs
+    })
+  }
+  await stopPerformanceTest()
+}
+
 async function toggleLogs(): Promise<void> {
   logsExpanded.value = !logsExpanded.value
   if (logsExpanded.value) {
@@ -553,7 +638,6 @@ watch(performanceTestLogs, async () => {
                   <Trash2 :size="18" aria-hidden="true" />
                 </button>
               </div>
-              <p class="performance-test__field-hint">{{ t('performanceTest.apiFormatHint') }}</p>
               <p v-if="workflowImportError" class="performance-test__workflow-error" role="alert">
                 {{ workflowImportError }}
               </p>
@@ -578,7 +662,6 @@ watch(performanceTestLogs, async () => {
                   />
                 </div>
               </div>
-              <p class="performance-test__field-hint">{{ t('performanceTest.warmupRunsHint') }}</p>
               <div class="performance-test__setting">
                 <label for="performance-test-measured-runs">
                   {{ t('performanceTest.measuredRuns') }}
@@ -601,7 +684,7 @@ watch(performanceTestLogs, async () => {
                   class="danger-solid performance-test__stop"
                   type="button"
                   :disabled="!canStop"
-                  @click="stopPerformanceTest"
+                  @click="stopPerformanceTestFromUser"
                 >
                   {{ isStopping ? t('performanceTest.stopping') : t('performanceTest.stop') }}
                 </button>
@@ -1321,13 +1404,6 @@ watch(performanceTestLogs, async () => {
 
 .performance-test__results-placeholder {
   margin: 0;
-}
-
-.performance-test__field-hint {
-  margin: 8px 0 0;
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .performance-test__account {
