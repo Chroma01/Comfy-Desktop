@@ -60,6 +60,7 @@ const isWorkflowImporting = ref(false)
 const isWorkflowDeleting = ref(false)
 const isLaunching = ref(false)
 const isStopping = ref(false)
+const isWorkflowLocked = computed(() => isLaunching.value || isStopping.value)
 const isExportingResults = ref(false)
 const exportResultsError = ref<string | null>(null)
 const logsExpanded = ref(true)
@@ -134,6 +135,8 @@ const canRun = computed(() => {
     workflowFilePath.value &&
     !isLaunching.value &&
     !isStopping.value &&
+    !isWorkflowImporting.value &&
+    !isWorkflowDeleting.value &&
     !sessionStore.isLaunching(sessionId)
   )
 })
@@ -182,7 +185,7 @@ function secondsToMilliseconds(seconds: number | null | undefined): number | nul
 }
 
 async function importWorkflow(sourcePath?: string): Promise<void> {
-  if (isWorkflowImporting.value || isWorkflowDeleting.value) return
+  if (isWorkflowImporting.value || isWorkflowDeleting.value || isWorkflowLocked.value) return
   isWorkflowImporting.value = true
   workflowImportError.value = null
   try {
@@ -201,15 +204,16 @@ async function importWorkflow(sourcePath?: string): Promise<void> {
 
 async function deleteWorkflow(): Promise<void> {
   const filePath = workflowFilePath.value
-  if (!filePath || isWorkflowDeleting.value) return
+  if (!filePath || isWorkflowDeleting.value || isWorkflowLocked.value) return
   isWorkflowDeleting.value = true
   workflowImportError.value = null
   try {
     const result = await window.api.deletePerformanceTestWorkflow(filePath)
-    if (result.ok && result.status === 'deleted') {
+    if (result.ok) {
       if (workflowFilePath.value === filePath) workflowFilePath.value = null
-    } else if (result.ok && result.status === 'preserved') {
-      workflowImportError.value = result.message || t('performanceTest.deleteFailed')
+      if (result.status === 'preserved') {
+        workflowImportError.value = result.message || t('performanceTest.deleteFailed')
+      }
     } else {
       workflowImportError.value = result.message || t('performanceTest.deleteFailed')
     }
@@ -232,7 +236,15 @@ async function dropWorkflow(event: DragEvent): Promise<void> {
 async function runPerformanceTest(): Promise<void> {
   const installationId = selectedInstallationId.value
   const filePath = workflowFilePath.value
-  if (!installationId || !filePath || isLaunching.value) return
+  if (
+    !installationId ||
+    !filePath ||
+    isLaunching.value ||
+    isStopping.value ||
+    isWorkflowImporting.value ||
+    isWorkflowDeleting.value
+  )
+    return
 
   correctWarmupRuns()
   correctMeasuredRuns()
@@ -604,14 +616,15 @@ watch(performanceTestLogs, async () => {
                   'performance-test__drop-zone--selected': workflowFilePath
                 }"
                 :aria-busy="isWorkflowImporting || isWorkflowDeleting"
-                @dragenter.prevent="isWorkflowDragging = true"
-                @dragover.prevent="isWorkflowDragging = true"
+                @dragenter.prevent="isWorkflowDragging = !isWorkflowLocked"
+                @dragover.prevent="isWorkflowDragging = !isWorkflowLocked"
                 @dragleave.prevent="isWorkflowDragging = false"
                 @drop.prevent="dropWorkflow"
               >
                 <button
                   class="performance-test__drop-content"
                   type="button"
+                  :disabled="isWorkflowLocked"
                   @click="importWorkflow()"
                 >
                   <span v-if="!workflowFilePath">
@@ -627,7 +640,7 @@ watch(performanceTestLogs, async () => {
                   </span>
                 </button>
                 <button
-                  v-if="workflowFilePath"
+                  v-if="workflowFilePath && !isWorkflowLocked"
                   class="performance-test__delete-workflow"
                   type="button"
                   :aria-label="t('performanceTest.deleteWorkflow')"
