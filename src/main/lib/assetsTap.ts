@@ -497,6 +497,9 @@ export function createAssetsTap(opts: {
     if (!match) return
     const [, event, tail] = match
     if (!event || tail === undefined) return
+    // Nothing from a line seen without consent: telemetry would drop its event anyway, and it must
+    // not count toward a summary a later grant ships, or spend the rate cap or field-name budget.
+    if (telemetry.getConsentState() !== 'granted') return
     if (!ALLOWED_EVENTS.has(event)) {
       // Counted, never named: the name is untrusted input, so carrying it in a
       // payload would reintroduce the cardinality blow-up the allow-list exists

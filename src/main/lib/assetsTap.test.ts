@@ -126,8 +126,12 @@ describe('assetsTap', () => {
     sessionKind: 'performance_test' as const
   }
 
+  let consent: ReturnType<typeof telemetry.getConsentState> = 'granted'
+
   beforeEach(() => {
     captured = []
+    consent = 'granted'
+    vi.spyOn(telemetry, 'getConsentState').mockImplementation(() => consent)
     vi.spyOn(telemetry, 'emit').mockImplementation((event, ctx) => {
       captured.push({ event, ctx: ctx as Record<string, unknown> })
     })
@@ -391,6 +395,62 @@ describe('assetsTap', () => {
       expect(captured[0]!.ctx).toMatchObject({ count: 2 })
       expect(JSON.stringify(captured[0]!.ctx)).not.toContain('exfiltrate')
       expect(JSON.stringify(captured[0]!.ctx)).not.toContain('scan_exploded')
+    })
+
+    it.each(['denied', 'undecided'] as const)(
+      'does not count what it saw while consent was %s, once consent is granted',
+      (declined) => {
+        consent = declined
+        const tap = createAssetsTap(baseOpts)
+        tap.ingest(taggedLine('seeder.scan_exploded', { phase: 'fast' }), 'stdout')
+        tap.ingest(taggedLine('scanner.hash_failed', { reason: 'quantum_flux' }), 'stdout')
+
+        // Nothing at all leaves the tap for a line seen without consent.
+        expect(captured).toEqual([])
+
+        consent = 'granted'
+        tap.flushSummary()
+
+        expect(captured.map((c) => c.event)).not.toContain(
+          'comfy.desktop.comfyui.assets.unknown_events_dropped'
+        )
+        expect(captured.map((c) => c.event)).not.toContain(
+          'comfy.desktop.comfyui.assets.unknown_enum_values_omitted'
+        )
+
+        // The same tap counts again from the grant on: consent is read per line, not at creation.
+        tap.ingest(taggedLine('seeder.scan_exploded', { phase: 'fast' }), 'stdout')
+        tap.ingest(taggedLine('scanner.hash_failed', { reason: 'quantum_flux' }), 'stdout')
+        tap.flushSummary()
+        const counts = Object.fromEntries(
+          captured
+            .filter(
+              (c) =>
+                c.event.endsWith('unknown_events_dropped') ||
+                c.event.endsWith('unknown_enum_values_omitted')
+            )
+            .map((c) => [c.event, c.ctx.count])
+        )
+        expect(counts).toEqual({
+          'comfy.desktop.comfyui.assets.unknown_events_dropped': 1,
+          'comfy.desktop.comfyui.assets.unknown_enum_values_omitted': 1
+        })
+      }
+    )
+
+    it('spends no rate-cap budget on lines seen without consent', () => {
+      consent = 'denied'
+      const tap = createAssetsTap(baseOpts)
+      for (let i = 0; i < 61; i++) {
+        tap.ingest(taggedLine('seeder.scan_started', { phase: 'fast' }), 'stdout')
+      }
+
+      consent = 'granted'
+      tap.ingest(taggedLine('seeder.scan_started', { phase: 'fast' }), 'stdout')
+
+      expect(captured.map((c) => c.event)).toEqual([
+        'comfy.desktop.comfyui.assets.seeder.scan_started'
+      ])
     })
 
     it('reports omitted enum values as a bare count, never the values', () => {
@@ -937,6 +997,18 @@ describe('assetsTap', () => {
           1
         ])
       )
+
+      it('not by a line seen without consent', () => {
+        consent = 'denied'
+        const tap = createAssetsTap(baseOpts)
+        tap.ingest(taggedLine('seeder.scan_completed', sixtyFourNames), 'stdout')
+
+        consent = 'granted'
+        tap.ingest(taggedLine('seeder.scan_completed', { zz_count: 7 }), 'stdout')
+
+        expect(captured).toHaveLength(1)
+        expect(captured[0]!.ctx).toMatchObject({ zz_count: 7 })
+      })
 
       it('not by a line rejected after its convention fields', () => {
         const tap = createAssetsTap(baseOpts)
