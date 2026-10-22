@@ -757,6 +757,98 @@ describe('installAgentRequirements with a version override', () => {
     ])
   })
 
+  it('installs a comfy-agent-go pin on its own line, holding everything else', async () => {
+    const sendOutput = vi.fn()
+    const go = { 'comfy-agent-go': '0.2.3' }
+    const decision = await installAgentRequirements(plan, sendOutput, undefined, undefined, go)
+
+    expect(decision).toEqual({ decision: 'applied', pins: new Map([['comfy-agent-go', '0.2.3']]) })
+    expect(calls).toEqual([
+      {
+        content: 'comfy-cli==1.21.0\ncomfy-agent-go==0.2.3\n',
+        constraints: 'requests==2.32.0\n'
+      }
+    ])
+    expect(sendOutput.mock.calls.join('')).not.toContain('bundled agent')
+  })
+
+  it("keeps a working agent when a Go pin alone meets core's placeholder agent line", async () => {
+    fs.writeFileSync(plan.reqPath, 'comfy-agent==0.0.0.dev0\n')
+    mockUvPip.mockResolvedValue({
+      code: 0,
+      output: JSON.stringify([
+        { name: 'comfy-agent', version: '0.1.0rc2' },
+        { name: 'comfy-agent-go', version: '0.1.0rc2' }
+      ])
+    })
+    const go = { 'comfy-agent-go': '0.1.0rc3' }
+    const decision = await installAgentRequirements(plan, vi.fn(), undefined, undefined, go)
+
+    expect(decision).toMatchObject({ decision: 'applied' })
+    expect(calls).toEqual([{ content: 'comfy-agent-go==0.1.0rc3\n', constraints: '\n' }])
+  })
+
+  it('installs a comfy-agent-go pin together with an agent pin', async () => {
+    const both = { 'comfy-agent': '0.2.3', 'comfy-agent-go': '0.2.3' }
+    const decision = await installAgentRequirements(plan, vi.fn(), undefined, undefined, both)
+
+    expect(decision).toMatchObject({ decision: 'applied' })
+    expect(calls).toEqual([
+      {
+        content: 'comfy-agent==0.2.3\ncomfy-cli==1.21.0\ncomfy-agent-go==0.2.3\n',
+        constraints: 'requests==2.32.0\n'
+      }
+    ])
+  })
+
+  it('installs a comfy-agent-go older than the agent, saying the agent will run its bundled one', async () => {
+    const sendOutput = vi.fn()
+    const old = { 'comfy-agent-go': '0.1.9' }
+    const decision = await installAgentRequirements(plan, sendOutput, undefined, undefined, old)
+
+    expect(decision).toMatchObject({ decision: 'applied' })
+    expect(calls[0]!.content).toBe('comfy-cli==1.21.0\ncomfy-agent-go==0.1.9\n')
+    expect(sendOutput.mock.calls.join('')).toContain(
+      '⚠ comfy-agent-go 0.1.9 is older than comfy-agent 0.2.0; the agent will run its bundled agent, not the Go one'
+    )
+  })
+
+  it("applies a Go pin on the same launch once core's file is in, and warns once it is", async () => {
+    mockUvPip
+      .mockResolvedValueOnce({
+        code: 0,
+        output: JSON.stringify([{ name: 'comfy-agent', version: '0.2.0' }])
+      })
+      .mockResolvedValueOnce({ code: 0, output: INSTALLED })
+    const sendOutput = vi.fn()
+    const old = { 'comfy-agent-go': '0.1.9' }
+    const decision = await installAgentRequirements(plan, sendOutput, undefined, undefined, old)
+
+    expect(decision).toEqual({ decision: 'applied', pins: new Map([['comfy-agent-go', '0.1.9']]) })
+    expect(calls).toEqual([
+      { content: CORE_FILE, constraints: null },
+      {
+        content: 'comfy-cli==1.21.0\ncomfy-agent-go==0.1.9\n',
+        constraints: 'requests==2.32.0\n'
+      }
+    ])
+    expect(
+      sendOutput.mock.calls.join('').split('is older than comfy-agent 0.2.0').length - 1,
+      'warned once, after the install, not on the attempt that waited for core'
+    ).toBe(1)
+  })
+
+  it('says nothing about the Go carrier when the override does not install', async () => {
+    respond = ({ constraints }) => ({ code: constraints === null ? 0 : 1, output: '' })
+    const sendOutput = vi.fn()
+    const old = { 'comfy-agent-go': '0.1.9' }
+    const decision = await installAgentRequirements(plan, sendOutput, undefined, undefined, old)
+
+    expect(decision).toMatchObject({ decision: 'reverted', reason: 'install_failed' })
+    expect(calls.at(-1), "core's file follows").toEqual({ content: CORE_FILE, constraints: null })
+    expect(sendOutput.mock.calls.join('')).not.toContain('bundled agent')
+  })
+
   it("lists the install's own environment as JSON, from the install dir", async () => {
     await installAgentRequirements(plan, vi.fn(), undefined, undefined, OVERRIDE)
 
