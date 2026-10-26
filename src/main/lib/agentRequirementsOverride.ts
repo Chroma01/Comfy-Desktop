@@ -253,8 +253,10 @@ function agentPackage(coreText: string): string | undefined {
 }
 
 /**
- * Pins every installed package where it is, so an override that moves one falls back, except the
- * agent file's own: `comfy-cli`, `nodejs-wheel-binaries`, `comfy-agent`, and the comfy-agent*
+ * Holds every installed package at or above its version, so an override that would move one down
+ * falls back. A local build (`+cpu`) stays exact: uv refuses `>=` on one, and the prefetch drops
+ * exactly those `==` lines. The agent file's own are exempt: `comfy-cli`, `nodejs-wheel-binaries`,
+ * `comfy-agent`, and the comfy-agent*
  * package `coreText` (the agent's file) lists. Those are freed whether or not this override pins
  * them, since the install also takes core's lines for them and must be able to land on those.
  * `comfy-agent-go` is among them: the agent's extras pin it to the agent's exact version, so
@@ -273,7 +275,7 @@ export function installedConstraints(
     name === FRONTEND_PACKAGE ? pins.has(name) : OVERRIDABLE.has(name) || name === agent
   const lines = installed
     .filter(({ name }) => !free(normalizePackageName(name)))
-    .map(({ name, version }) => `${name}==${version}`)
+    .map(({ name, version }) => `${name}${version.includes('+') ? '==' : '>='}${version}`)
   return lines.join('\n') + '\n'
 }
 
