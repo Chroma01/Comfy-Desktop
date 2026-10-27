@@ -517,7 +517,8 @@ export interface StorageLaunchState {
 export function applyStorageLaunchArgs(
   inst: InstallationRecord,
   installationId: string,
-  launchCmd: LaunchCommand
+  launchCmd: LaunchCommand,
+  storage: Pick<settings.Settings, 'modelsDirs' | 'inputDir' | 'outputDir'>
 ): StorageLaunchState {
   // Shared models and shared input/output are independent flags.
   const argsAvailable = !launchCmd.skipSharedPaths && !!launchCmd.args
@@ -530,7 +531,7 @@ export function applyStorageLaunchArgs(
   let modelSyncOptions: ModelPathsOptions = {}
   let manageModelFolders = false
   if (argsAvailable) {
-    const sharedDirs = (settings.get('modelsDirs') as string[] | undefined) ?? []
+    const sharedDirs = storage.modelsDirs ?? []
     const { dirs, primaryDir } = resolveLauncherModelDirs(inst, sharedDirs)
     if (dirs.length > 0) {
       manageModelFolders = true
@@ -562,8 +563,7 @@ export function applyStorageLaunchArgs(
     const useSharedInput = (inst.useSharedInput as boolean | undefined) !== false
     const useSharedOutput = (inst.useSharedOutput as boolean | undefined) !== false
     if (useSharedInput) {
-      const inputDir =
-        (settings.get('inputDir') as string | undefined) || settings.defaults.inputDir
+      const inputDir = storage.inputDir || settings.defaults.inputDir
       fs.mkdirSync(inputDir, { recursive: true })
       launchCmd.args!.push('--input-directory', inputDir)
     } else {
@@ -574,8 +574,7 @@ export function applyStorageLaunchArgs(
       }
     }
     if (useSharedOutput) {
-      const outputDir =
-        (settings.get('outputDir') as string | undefined) || settings.defaults.outputDir
+      const outputDir = storage.outputDir || settings.defaults.outputDir
       fs.mkdirSync(outputDir, { recursive: true })
       launchCmd.args!.push('--output-directory', outputDir)
     } else {
@@ -1443,6 +1442,13 @@ async function runLaunch(
     return { ok: false, message: i18n.t('errors.noEnvFound') }
   }
   const launchCmd = launchCmdRaw
+  // Only a launch that passes Desktop's folders needs settings; it must not use stand-in defaults.
+  const storageSettings =
+    !launchCmd.skipSharedPaths && launchCmd.args
+      ? await settings.readSettled(abort.signal)
+      : settings.defaults
+  if (abort.signal.aborted) return { ok: false, cancelled: true }
+  if (!storageSettings) return { ok: false, message: i18n.t('errors.settingsUnreadable') }
 
   // Filter unsupported args, then inject desktop-managed feature flags.
   if (launchCmd.cmd && launchCmd.args && launchCmd.cwd) {
@@ -1673,7 +1679,7 @@ async function runLaunch(
   startHandedBack()
 
   const { preLaunchExtras, manageModelFolders, modelDirsForLaunch, modelSyncOptions } =
-    applyStorageLaunchArgs(inst, installationId, launchCmd)
+    applyStorageLaunchArgs(inst, installationId, launchCmd, storageSettings)
 
   /** Gates the `template-models` row: the bar derives "prior steps done" from
    *  the active phase index, so the row stays silent through the real phases and
